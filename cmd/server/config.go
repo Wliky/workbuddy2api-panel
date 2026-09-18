@@ -28,6 +28,12 @@ type Config struct {
 		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
 		// 0/负数视为非法 → normalize 回落默认并记录。
 		MaxBodyMB int `json:"max_body_mb"`
+
+		// PanelRoot 把管理面板同时挂到根路径（缺省 false，需显式开启）。
+		// 开启后 http://host:7863/ 即面板首页，/api/* 与 /app.js 自动重写到 /panel 前缀；
+		// 网关自身路由 /v1/*、/status、/healthz 优先级更高，不受影响。
+		// /panel/* 始终保留可用（向后兼容旧链接与文档）。
+		PanelRoot bool `json:"panel_root"`
 	} `json:"server"`
 
 	Cooldown struct {

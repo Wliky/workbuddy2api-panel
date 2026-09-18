@@ -273,6 +273,8 @@ func main() {
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		// 根路径直达面板（server.panel_root=true 时）：/ → 面板首页。
+		PanelRoot: cfg.Server.PanelRoot,
 	})
 	chatHandler = h
 

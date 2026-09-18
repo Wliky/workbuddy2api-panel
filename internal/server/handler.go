@@ -47,6 +47,12 @@ type Config struct {
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
 	Panel http.Handler
 
+	// PanelRoot=true 时额外支持**根路径直达面板**：/ → 面板首页，
+	// /api/xxx → /panel/api/xxx，/app.js → /panel/app.js。
+	// 网关自身路由（/v1/*、/status、/healthz）优先级更高，不受影响。
+	// /panel/* 始终可用（向后兼容）。
+	PanelRoot bool
+
 	// Live 运行期可变配置（面板在线改 api_key / soft_rate / 脱敏开关时立即生效）。
 	// nil 时回退静态字段（测试与裸用场景）。
 	Live *livecfg.Holder
@@ -153,7 +159,56 @@ func NewHandler(cfg Config) *Handler {
 	return h
 }
 
+// rootProbePaths 挂根路径时**必须让出**的路径：这些是网关自身 API，不能被面板接管。
+// 其余未匹配路径（含 /、/app.js、/api/*）在 PanelRoot 开启时重写到 /panel 前缀。
+//
+// ⚠️ 这里必须显式覆盖**全部**网关路由，不能依赖 ServeMux 的匹配优先级 ——
+// ServeMux 只在"请求没被重写"时才按 pattern 具体度选择；一旦入口重写把 /v1/models
+// 变成 /panel/v1/models，网关路由就再也匹配不到了。
+// 2026-09-18 漏列 /v1/ 导致 /v1/models 与 /v1/chat/completions 全 404（面板吃掉了网关 API），
+// 已由 TestPanelRootDoesNotShadowGatewayAPI 锁死为回归测试。
+var rootProbePaths = map[string]bool{
+	"/healthz": true,
+	"/status":  true,
+}
+
+// isGatewayPath 判断请求路径是否属于网关自身 API（面板不得接管）。
+// 覆盖 /status、/healthz 与 /v1 全族（/v1/models、/v1/chat/completions…）。
+func isGatewayPath(p string) bool {
+	if rootProbePaths[p] {
+		return true
+	}
+	// /v1 及其子路径；注意 /v1x 不应被误认为网关路径。
+	return p == "/v1" || strings.HasPrefix(p, "/v1/")
+}
+
+// rewriteToPanelRoot 把根路径形态的请求重写为 /panel 前缀形态，**原地改 r**。
+//
+// 设计意图：面板 handler 内部 36 条路由与前端 app.js 的 fetch 都硬编码了 /panel 前缀，
+// 与其全量改写（易漏、且前端缓存旧版会立刻全 404），不如在入口处做一次重写 ——
+// 挂载点变成可选项，而面板内部实现零改动。
+//
+// /panel/* 原样放行（保留旧链接与文档里的地址可用）。
+func rewriteToPanelRoot(r *http.Request) {
+	p := r.URL.Path
+	if p == "/panel" || strings.HasPrefix(p, "/panel/") {
+		return // 已经是 /panel 形态，不动
+	}
+	if isGatewayPath(p) {
+		return // 让给网关 API（/healthz、/status、/v1/*）
+	}
+	if p == "/" {
+		r.URL.Path = "/panel/"
+		return
+	}
+	// /app.js → /panel/app.js；/api/overview → /panel/api/overview
+	r.URL.Path = "/panel" + p
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.PanelRoot && h.cfg.Panel != nil {
+		rewriteToPanelRoot(r)
+	}
 	h.mux.ServeHTTP(w, r)
 }
 
