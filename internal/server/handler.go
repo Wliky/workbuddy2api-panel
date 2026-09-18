@@ -205,7 +205,33 @@ func rewriteToPanelRoot(r *http.Request) {
 	r.URL.Path = "/panel" + p
 }
 
+// corsPreflight 处理浏览器跨域（CORS）。
+// 背景：网关与面板均为纯 Bearer 鉴权（无 Cookie 会话），放开 CORS 不存在
+// 凭据自动携带类攻击面；而面板内置的密钥测试器、以及部署在其它域名下的
+// 网页版聊天前端，都从浏览器发 fetch —— 没有 CORS 头时 OPTIONS 预检会被
+// ServeMux 以 405 拒掉，浏览器直接报 "Failed to fetch"。
+// 用 * 而非回显 Origin：无需 credentials，语义最简单且足够。
+func corsPreflight(w http.ResponseWriter, r *http.Request) bool {
+	if r.Header.Get("Origin") == "" {
+		return false
+	}
+	// 实际响应也要带 Allow-Origin（浏览器对正式请求同样校验）
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+	h.Set("Access-Control-Max-Age", "86400")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+	return false
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if corsPreflight(w, r) {
+		return
+	}
 	if h.cfg.PanelRoot && h.cfg.Panel != nil {
 		rewriteToPanelRoot(r)
 	}
