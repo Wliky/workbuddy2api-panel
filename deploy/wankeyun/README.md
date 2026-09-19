@@ -94,7 +94,7 @@ docker-compose up -d --force-recreate
 把 `wb2api-pull-update.sh` 传到设备（例如 `/root/wb2api-pull-update.sh`），然后：
 
 ```bash
-bash /root/wb2api-pull-update.sh --check       # 先看有没有新版，零副作用
+bash /root/wb2api-pull-update.sh --check       # 先看有没有新版（会拉镜像比对，不改配置、不重建）
 bash /root/wb2api-pull-update.sh               # 升级
 bash /root/wb2api-pull-update.sh --list        # 看有哪些备份点
 bash /root/wb2api-pull-update.sh --rollback    # 回滚到升级前的镜像与数据
@@ -102,7 +102,10 @@ bash /root/wb2api-pull-update.sh --rollback    # 回滚到升级前的镜像与�
 
 执行顺序是刻意设计的：
 
-1. **拉镜像** → 判断是否真有新版（`--check` 在这一步就退出，绝不改动任何东西）
+1. **拉镜像** → 判断是否真有新版。判断要看三件事：compose 的 `image` 行、
+   容器现用镜像 id、目标镜像是否已拉到本地 —— 只比"镜像 id 变没变"会误判
+   （镜像已被 `--check` 拉到本地时 id 相同，但 compose 可能还指着 `wb2api:local`）。
+   `--check` 在这一步退出：不改配置、不重建，但**已下载的镜像会留在本地**
 2. **备份账号数据**（见下一节）—— 只在确认要升级之后才做
 3. 改 compose 的 `image` 行（只动这一行，CasaOS 的其它字段一字不改）
 4. `docker-compose up -d --force-recreate`
@@ -191,8 +194,8 @@ rename /app/config.json.tmp /app/config.json: permission denied
 三个挂载点 `/app/data`、`/app/auths`、`/app/config.json` 全部不变 ——
 所以这是**原地替换**：账号池、配置、用量数据一个都不会丢。
 
-旧的 `玩客云部署/update.sh` 仍然可用（`--no-pull` 跳过 git 拉取），
-在 GitHub Actions 出问题时作为兜底。
+旧的 `玩客云部署/update.sh`（本机交叉编译 → SFTP 传二进制 → 设备上本地 build 镜像）
+在 GitHub Actions 出问题时仍可作兜底，但它**不更新镜像来源**，日常升级请用本目录方案。
 
 ---
 
@@ -219,3 +222,48 @@ rename /app/config.json.tmp /app/config.json: permission denied
 → 面板走根路径直达，需要配置里 `server.panel_root = true`。
 确认 `https://wb.005201.xyz/` 能开（而不是 `/panel/`）；
 再看 cloudflared 隧道 ingress 是否还指向 `localhost:7863`。
+
+---
+
+## 切换实测记录（2026-09-19）
+
+在玩客云（S805 / armv7l / 983MB）上实跑了一次完整切换，留档备查。
+
+| 项 | 结果 |
+|---|---|
+| fork 推送 | `Wliky/workbuddy2api-panel` main = `87d20ba`（8 个提交，含 armv7 CI） |
+| 首次构建 | run 35427472608 —— 镜像其实已推送，但架构校验步骤误报失败（原因见下） |
+| 修复后构建 | run 35427819434 / 35428084705 —— **全绿** |
+| 镜像 | `ghcr.io/wliky/workbuddy2api-panel:armv7` = `sha256:30e0504e…`（92.2MB），config 里 `architecture=arm / variant=v7` |
+| 包可见性 | 新建即 public —— 设备上**匿名 `docker pull` 直接成功**，无需 `docker login` |
+| 升级前备份 | `/root/wb2api-backups/20260919-145808`（`data.tar.gz` + `auths/` 明文 4 份 + compose 原文） |
+| 切换动作 | compose 第 17 行 `wb2api:local` → GHCR 镜像，`docker-compose up -d --force-recreate` |
+| 冒烟 | 容器 `running` + `health=healthy` + `/healthz` 200 + 账号数 **4 → 4** + `/status healthy=4` |
+| 数据 | 15 个用量桶（`data/usage.json` 2906B）完整恢复；日志 `loaded 4 account(s) from ./auths` |
+| 域名 | `https://wb.005201.xyz/` → **200（51439B，`<title>WorkBuddy2API · 控制台</title>`）**，根路径直达 |
+| CORS | 公网 OPTIONS 预检 → **204** 且带 `access-control-allow-origin: *`；带 Bearer 的真实请求同样带头 |
+| 上游同步 | 手动 dispatch `sync-upstream` → success；上游无新提交，合并/推送/触发三步按预期 skipped |
+| 磁盘 | 根分区 2877MB 可用，悬空镜像 0 |
+
+### 与 `wb2api:local` 的差异（只有一处，且是刻意加的）
+
+新镜像**多一个 `HEALTHCHECK`**（打 `127.0.0.1:7863/healthz`），现役旧镜像没有。
+compose 里不写 healthcheck，于是容器会带上健康状态 —— CasaOS 与脚本都能据此
+区分「进程活着」和「服务就绪」。其余 `EXPOSE`（都没有）、`USER`（都是 root）、
+`Entrypoint/Cmd`、`Volumes`、`/app` 四个二进制大小**完全一致**。
+
+### 首次构建失败的真正原因（不是镜像问题）
+
+本工作流 `provenance=false` 且只推 `linux/arm/v7` 单平台，registry 里存的是一份
+image manifest 而非 index，`docker buildx imagetools inspect` 对这种镜像**不打印
+`Platform:` 行**，grep `linux/arm/v7` 必然误判失败，还会连带跳过离线 tar 与摘要两步。
+已改为硬证据校验：`docker pull --platform linux/arm/v7` 后用
+`docker image inspect --format '{{.Architecture}}{{.Variant}}'` 读镜像 config，
+得到 `armv7` 才通过。
+
+### CasaOS 会不会覆写 compose？
+
+实测排查过：整机只有 `/var/lib/casaos/apps/wb2api/docker-compose.yml`（及 `.bak`）
+引用 wb2api，`/var/lib/casaos/db/*.db` 里没有镜像定义 —— **compose 文件就是唯一事实源**，
+直接改它 + `docker-compose up -d` 是安全的。切换后容器的
+`com.docker.compose.project=wb2api` 标签仍在，CasaOS 不会显示「待重建」。
