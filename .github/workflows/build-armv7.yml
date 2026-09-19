@@ -1,0 +1,216 @@
+# ===========================================================================
+#  armv7（linux/arm/v7）构建 + 镜像发布
+#
+#  上游只发 amd64/arm64，armv7 必须自建 —— 本工作流就是补这一块。
+#
+#  触发方式与产物：
+#    - push 到 main   → 交叉编译 4 个二进制（artifact）+ 构建并推送镜像 :armv7 / :main / :sha-xxxxxxx
+#    - 打 tag (v*)    → 同上，镜像额外多打 :<版本>-armv7 与 :<版本>
+#    - 手动 dispatch  → 同上；可选额外导出离线镜像 tar.gz（国内拉不动 GHCR 时 docker load）
+#
+#  为什么镜像里不编译（而用 Dockerfile.armv7 + 预编译产物）：
+#    上游 Dockerfile 的构建阶段没有 --platform=$BUILDPLATFORM，多平台构建时 QEMU 会
+#    以 armv7 模拟方式跑 `go build`，慢且容易在 runner 上超时。这里改成：先在 amd64
+#    上原生交叉编译（纯 Go + CGO_ENABLED=0，零障碍），镜像只做 COPY。
+#    镜像层里仍有 RUN apk add，所以 QEMU 还是要装 —— 但那只是几秒钟的事。
+#
+#  与设备现役 wb2api:local 的关系：
+#    Dockerfile.armv7 产出的 /app 布局与设备上 /root/wb2api-image/app 逐字节同构，
+#    可直接原地替换镜像 tag；挂载卷（/app/data、/app/auths、/app/config.json）不变。
+#    因此**不影响现有 armv7 部署**，也不需要改设备上的任何数据目录。
+# ===========================================================================
+
+name: build-armv7
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      offline_tar:
+        description: '额外导出离线镜像 tar.gz（供 docker load，约 110MB）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+# 同一分支的构建串行化；新推送取消尚未跑完的旧构建（镜像 :armv7 是移动标签）
+concurrency:
+  group: build-armv7-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. 交叉编译 armv7 静态二进制
+  # -------------------------------------------------------------------------
+  build:
+    name: 交叉编译 armv7
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: 构建四个二进制（GOARCH=arm GOARM=7 CGO_ENABLED=0）
+        env:
+          GOOS: linux
+          GOARCH: arm
+          GOARM: "7"
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for pair in "server:wb2api" "signin:signin_bin" "login:login" "credit:credit"; do
+            cmd="${pair%%:*}"; out="${pair##*:}"
+            echo "building $out <- ./cmd/$cmd"
+            go build -trimpath -ldflags="-s -w" -o "dist/$out" "./cmd/$cmd"
+          done
+          ls -lh dist
+
+      - name: 校验 ELF 架构（必须是 ARM = EM_ARM 0x0028）
+        run: |
+          set -euo pipefail
+          for f in dist/*; do
+            file "$f"
+            if ! readelf -h "$f" | grep -qE 'Machine:.*ARM'; then
+              echo "::error file=$f::$f 不是 ARM 产物，构建中止"
+              exit 1
+            fi
+          done
+          echo "四个产物均为 EM_ARM ✅"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wb2api-armv7
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 写入构建摘要
+        run: |
+          {
+            echo "### armv7 二进制已产出"
+            echo
+            echo "| 文件 | 大小 |"
+            echo "|---|---|"
+            for f in dist/*; do
+              printf '| `%s` | %s |\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # 2. 构建并推送 armv7 镜像到 GHCR
+  # -------------------------------------------------------------------------
+  image:
+    name: 推送 GHCR 镜像
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 取回上一步的二进制，填进 dist/ —— Dockerfile.armv7 从这里 COPY
+      - uses: actions/download-artifact@v4
+        with:
+          name: wb2api-armv7
+          path: dist
+
+      - name: 校验取回的产物
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          test -f dist/wb2api || { echo "::error::dist/wb2api 缺失"; exit 1; }
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像名与标签
+        id: meta
+        run: |
+          set -euo pipefail
+          # GHCR 要求全小写；GITHUB_REPOSITORY 的 owner 可能含大写
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SHORT="${GITHUB_SHA::7}"
+          {
+            echo "image=$IMAGE"
+            echo "tags<<__TAGS__"
+            echo "$IMAGE:armv7"
+            echo "$IMAGE:main"
+            echo "$IMAGE:sha-$SHORT"
+            if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+              echo "$IMAGE:${GITHUB_REF_NAME#v}-armv7"
+              echo "$IMAGE:${GITHUB_REF_NAME#v}"
+            fi
+            echo "__TAGS__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.armv7
+          platforms: linux/arm/v7
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # 关键：关掉 provenance / sbom。否则会额外生成 attestation 清单，
+          # 设备上的 Docker 20.10.24 + devicemapper 拉取时容易出错。
+          provenance: false
+          sbom: false
+
+      - name: 校验已推送镜像的架构
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${{ steps.meta.outputs.image }}:armv7" | tee /tmp/inspect.txt
+          grep -q 'linux/arm/v7' /tmp/inspect.txt \
+            || { echo "::error::推送的镜像里没有 linux/arm/v7"; exit 1; }
+          echo "镜像架构校验通过 ✅"
+
+      # 国内设备拉不动 GHCR 时用这条：导出 docker-format tar 再 docker load
+      - name: 导出离线镜像 tar.gz
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.offline_tar || startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file ./Dockerfile.armv7 \
+            --platform linux/arm/v7 \
+            --provenance=false \
+            --output type=docker,dest=/tmp/wb2api-armv7.tar \
+            .
+          gzip -9 /tmp/wb2api-armv7.tar
+          ls -lh /tmp/wb2api-armv7.tar.gz
+
+      - name: 上传离线镜像
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.offline_tar || startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: wb2api-armv7-image-tar
+          path: /tmp/wb2api-armv7.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 写入镜像摘要
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "设备侧拉取：\`docker pull ${{ steps.meta.outputs.image }}:armv7\`"
+            echo
+            echo "> 首次推送后请到 GitHub → 个人头像 → Packages 里把该包可见性设为 **Public**，"
+            echo "> 否则设备需要先 \`docker login ghcr.io\` 才能匿名拉取。"
+          } >> "$GITHUB_STEP_SUMMARY"

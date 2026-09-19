@@ -1,0 +1,82 @@
+# ===========================================================================
+#  玩客云（OneCloud / S805 / armv7l）镜像拉取版 compose
+#
+#  用法：把本文件覆盖到设备上的 /var/lib/casaos/apps/wb2api/docker-compose.yml
+#        （或走 CasaOS API 提交），然后 docker-compose up -d --force-recreate。
+#
+#  与设备上原「本地构建」版的唯一差异：
+#      image: wb2api:local  →  image: ghcr.io/wliky/workbuddy2api-panel:armv7
+#
+#  其余字段（容器名、挂载卷、端口、资源限制、CasaOS 标识）**逐字保留**，
+#  因此是原地替换 —— /DATA/AppData/wb2api 下的账号、配置、数据一个都不会动。
+#
+#  为什么用 GHCR 而不是 Docker Hub（2026-09-19 在设备上实测）：
+#      ghcr.io          → HTTP 401（registry 在线，未认证的正常响应），可直连
+#      registry-1.docker.io → 10 秒超时，直连不通（只能走 daemon.json 里的国内镜像源）
+#  所以 GHCR 是这台设备上唯一能直接 `docker pull` 的现成路径。
+#
+#  ⚠️ 首次推送后必须去 GitHub → Packages 把该包可见性设为 Public，
+#     否则匿名拉取会 403（私有包需要设备上先 docker login ghcr.io）。
+# ===========================================================================
+name: wb2api
+services:
+    wb2api:
+        container_name: wb2api
+        image: ghcr.io/wliky/workbuddy2api-panel:armv7
+        hostname: wb2api
+        restart: unless-stopped
+        network_mode: bridge
+        # 显式写全 CMD，与设备现役容器一致（镜像里也有同样的 CMD）
+        command:
+            - /app/wb2api
+            - -config
+            - /app/config.json
+        environment:
+            TZ: Asia/Shanghai
+        ports:
+            - target: 7863
+              published: "7863"
+              protocol: tcp
+        volumes:
+            # 账号池：升级不丢登录态
+            - type: bind
+              source: /DATA/AppData/wb2api/auths
+              target: /app/auths
+            # 用量/任务状态等运行时数据
+            - type: bind
+              source: /DATA/AppData/wb2api/data
+              target: /app/data
+            # 真实配置。**宿主机必须先有该文件**：缺失时 Docker 会把挂载点
+            # 创建成目录，容器启动即失败。不挂 :ro —— 面板「配置」页要写回它。
+            - type: bind
+              source: /DATA/AppData/wb2api/config.json
+              target: /app/config.json
+        cpu_shares: 90
+        deploy:
+            resources:
+                # 256MB 上限。实测常驻约 60–90MB，留足余量给任务突发。
+                limits:
+                    memory: "268435456"
+        labels:
+            # 与设备原配置保持一致，避免 CasaOS 图标变默认
+            icon: https://download.codebuddy.cn/web/workbuddy/93a7cd0d70556625552d16b09c6a9cf8c2e089b9/assets/logo.svg
+networks:
+    default:
+        name: wb2api_default
+x-casaos:
+    author: self
+    category: self
+    # 面板走根路径直达（server.panel_root=true），所以这里 index 是 / 而不是 /panel/
+    hostname: wb.005201.xyz
+    icon: https://download.codebuddy.cn/web/workbuddy/93a7cd0d70556625552d16b09c6a9cf8c2e089b9/assets/logo.svg
+    index: /
+    is_uncontrolled: false
+    main: wb2api
+    # 走 cloudflared 隧道 + 域名，不在 CasaOS 里做端口映射
+    port_map: ""
+    scheme: http
+    store_app_id: wb2api
+    title:
+        custom: workbuddy
+        en_us: workbuddy2api
+        zh_cn: workbuddy2api

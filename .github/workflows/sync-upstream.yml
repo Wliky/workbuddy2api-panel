@@ -1,0 +1,181 @@
+# ===========================================================================
+#  上游同步：检查 linguo2625469/workbuddy2api-panel 是否有新提交，有则合并进来
+#
+#  设计要点（每条都对应一个真实的坑）：
+#
+#  1. **用 merge 而不是 rebase / reset**。
+#     本 fork 有自己的提交（根路径直达面板 server.panel_root、CORS 预检、
+#     单文件 bind mount 下配置写入的 EBUSY 兜底），rebase 会重写这些提交的
+#     hash，reset 则会直接从历史里丢掉它们。merge 是唯一能既跟上上游、
+#     又保住 fork 改动的做法。
+#
+#  2. **冲突时不推送、不猜**。`git merge` 失败即 `git merge --abort` 回到干净
+#     状态并以非零码退出，让人来解。自动解冲突会把两边的语义混在一起，
+#     而这个项目里 handler.go / config.go 正是 fork 与上游都会碰的文件。
+#
+#  3. **推送后用 workflow_dispatch 显式拉起构建**。
+#     GITHUB_TOKEN 触发的 push 事件不会触发其它 workflow（GitHub 的防递归设计，
+#     workflow_dispatch 与 repository_dispatch 是官方例外）—— 所以推完 main
+#     不显式 dispatch 的话，build-armv7 根本不会跑，镜像不会更新。
+#     若配置了 secrets.SYNC_PAT（PAT 推送**会**触发后续 workflow），则跳过 dispatch
+#     以免重复构建。
+#
+#  4. **本工作流只监听 schedule / workflow_dispatch**，不监听 push —— 从根上
+#     杜绝「同步 → push → 再同步」的循环。
+#
+#  可选配置：
+#     secrets.SYNC_PAT —— 一个 fine-grained PAT（contents: read/write, actions: write）。
+#     不配也能跑，只是多一次显式 dispatch 调用。
+# ===========================================================================
+
+name: sync-upstream
+
+on:
+  schedule:
+    # 每 6 小时第 17 分检查一次（避开整点高峰）
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '即使上游无更新，也重新构建一次'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: linguo2625469/workbuddy2api-panel
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    name: 检查并合并上游更新
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出 fork 的 main（完整历史）
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # 配了 SYNC_PAT 就用它（推送能触发后续 workflow）；否则退回 GITHUB_TOKEN
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: 判断是否走的 PAT
+        id: tok
+        env:
+          # 经 env 传入，避免直接把密钥插值进脚本正文
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          if [ -n "$SYNC_PAT" ]; then
+            echo "pat=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pat=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 配置 git 身份
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 拉取上游
+        id: fetch
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          UPSTREAM_SHA=$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "上游 ${UPSTREAM_BRANCH} 当前为 ${UPSTREAM_SHA}"
+
+      - name: 比较差异
+        id: diff
+        run: |
+          set -euo pipefail
+          BEHIND=$(git rev-list --count HEAD..upstream/${UPSTREAM_BRANCH})
+          AHEAD=$(git rev-list --count upstream/${UPSTREAM_BRANCH}..HEAD)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "ahead=$AHEAD"   >> "$GITHUB_OUTPUT"
+          echo "落后上游 $BEHIND 个提交；fork 自有提交 $AHEAD 个"
+          if [ "$BEHIND" != "0" ]; then
+            echo "--- 待合并的上游提交 ---"
+            git log --oneline HEAD..upstream/${UPSTREAM_BRANCH} | head -30
+          fi
+
+      - name: 合并上游
+        id: merge
+        if: steps.diff.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+          if git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            echo "合并成功：$(git rev-parse --short HEAD)"
+          else
+            echo "::error::上游更新与 fork 自有改动冲突，已回滚，未做任何推送。"
+            git merge --abort || true
+            {
+              echo "### ❌ 上游同步冲突，需要人工处理"
+              echo
+              echo "上游 \`${UPSTREAM_REPO}\` 的新提交与 fork 改动冲突，工作流已中止，**没有推送任何东西**。"
+              echo
+              echo "本地处理："
+              echo
+              echo '```bash'
+              echo "git remote add upstream https://github.com/${UPSTREAM_REPO}.git"
+              echo "git fetch upstream main"
+              echo "git merge upstream/main     # 解冲突"
+              echo "git push origin main"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: 推送合并结果
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${UPSTREAM_BRANCH}"
+          echo "已推送 $(git rev-parse --short HEAD) 到 origin/${UPSTREAM_BRANCH}"
+
+      - name: 显式触发 armv7 构建（仅在未使用 PAT 时）
+        if: steps.tok.outputs.pat == 'false' && (steps.merge.outputs.merged == 'true' || inputs.force_build)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 刚推送完，GitHub 侧的 ref 可能还没完全可见，重试几次
+          for i in 1 2 3 4 5; do
+            if gh workflow run build-armv7.yml --ref "${UPSTREAM_BRANCH}"; then
+              echo "已触发 build-armv7"
+              exit 0
+            fi
+            echo "触发失败（第 $i 次），5 秒后重试..."
+            sleep 5
+          done
+          echo "::error::无法触发 build-armv7，请到 Actions 页面手动运行"
+          exit 1
+
+      - name: 写入摘要
+        if: always()
+        run: |
+          {
+            echo "## 上游同步结果"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 | \`${UPSTREAM_REPO}\` |"
+            echo "| 上游 HEAD | \`${{ steps.fetch.outputs.upstream_sha || '未取到' }}\` |"
+            echo "| 落后提交数 | ${{ steps.diff.outputs.behind || 'n/a' }} |"
+            echo "| fork 自有提交 | ${{ steps.diff.outputs.ahead || 'n/a' }} |"
+            echo "| 本次是否合并 | ${{ steps.merge.outputs.merged == 'true' && '是' || '否（已是最新或冲突）' }} |"
+            echo
+            if [ "${{ steps.merge.outputs.merged }}" = "true" ]; then
+              echo "> fork 自有改动（panel_root / CORS / 配置写入兜底）已通过 merge 保留。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

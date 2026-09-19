@@ -1,0 +1,66 @@
+# syntax=docker/dockerfile:1
+# ===========================================================================
+#  玩客云 / S805 / armv7l（32 位 ARM）专用**运行镜像**
+#
+#  与仓库自带 Dockerfile 的三点区别（都是为了这台 1GB 内存的老设备）：
+#
+#   1. **镜像内不编译**。四个二进制由 CI 在 amd64 runner 上交叉编译好
+#      （GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0），这里只负责 COPY。
+#      好处有二：armv7 构建不需要 QEMU 模拟 `go build`（S805 上 4×A5 跑构建
+#      基本等于 OOM）；且镜像内容与 Actions artifact 完全同源，可互相校验。
+#
+#   2. **不写 EXPOSE**。CasaOS 会读镜像的 ExposedPorts 做端口占用检测，
+#      上游镜像的 `EXPOSE 7863` 在 CasaOS 里会误报 "there are ports in use"。
+#      端口一律交给 compose 的 `ports:` 声明（与设备现役配置一致）。
+#
+#   3. **布局与设备现役的 wb2api:local 逐字节对齐**
+#      （/app/{wb2api,signin_bin,login,credit,*.sh,probe_active.py}），
+#      所以可以原地替换镜像 tag，挂载卷与 config.json 路径都不用动。
+#
+#  构建（CI 中 dist/ 由 actions/download-artifact 填入）：
+#     docker buildx build -f Dockerfile.armv7 \
+#       -t ghcr.io/<owner>/<repo>:armv7 --platform linux/arm/v7 .
+# ===========================================================================
+FROM alpine:3.20
+
+# python3 —— login.sh / signin.sh / credit.sh 的 JSON 解析与落盘
+# bash    —— 三个脚本的 shebang 都是 bash（不是 sh）
+# tzdata  —— 任务调度与日志按 Asia/Shanghai
+# curl    —— 面板/脚本探活
+# ca-certificates —— 出网 HTTPS（腾讯侧接口）
+#
+# 刻意不装 gcc：四个二进制都是 CGO_ENABLED=0 的静态产物，运行期不需要编译。
+RUN apk add --no-cache python3 bash tzdata curl ca-certificates \
+ && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+ && echo "Asia/Shanghai" > /etc/timezone
+
+WORKDIR /app
+
+# 交叉编译产物：wb2api（网关+内嵌面板）、signin_bin、login、credit
+COPY dist/ /app/
+# 运行期脚本
+COPY login.sh signin.sh credit.sh /app/
+# 模型上限探测脚本（设备历史上放在 /app/probe_active.py，此处保持一致）
+COPY scripts/probe_active.py /app/probe_active.py
+# 镜像内不放真实配置：example 作默认，生产由挂载卷 /app/config.json 覆盖
+COPY config.example.json /app/config.json
+
+# CRLF 归一化 —— Windows 检出的 .sh 若带 \r，容器内会报
+# "bad interpreter: No such file or directory"（/bin/bash\r）。
+# /app/scripts 是历史遗留目录，保留以免旧脚本路径 404。
+RUN sed -i 's/\r$//' /app/*.sh \
+ && chmod 755 /app/*.sh /app/wb2api /app/signin_bin /app/login /app/credit \
+ && mkdir -p /app/data /app/auths /app/scripts
+
+VOLUME ["/app/data", "/app/auths"]
+
+# 刻意**不设 USER**：设备上现役容器以 root 运行（docker inspect 显示 User=[]），
+# /DATA/AppData/wb2api 下 config.json 与 auths/ 属主均为 root:root。
+# 改成非 root 会立刻踩到「写 auths/*.json.tmp permission denied」。
+# 详见 deploy/wankeyun/README.md「权限」一节。
+
+# 健康检查打 /healthz（该路由无需鉴权）。wget 由 busybox 提供。
+HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
+
+CMD ["/app/wb2api", "-config", "/app/config.json"]

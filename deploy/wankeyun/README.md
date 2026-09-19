@@ -1,0 +1,176 @@
+# 玩客云（armv7l）镜像拉取部署
+
+面向 **OneCloud / S805 / armv7l 32 位** 设备的部署与升级。目标是把「在设备上本地 build
+镜像」换成「**直接 `docker pull`**」—— S805 只有 4×Cortex-A5 @1.5GHz 和 1GB 内存，
+本地编译又慢又容易 OOM。
+
+> 本目录只解决**运行与升级**。armv7 的**构建**在 GitHub Actions 完成
+> （`.github/workflows/build-armv7.yml` → 推送到 GHCR）。
+
+---
+
+## 目录内容
+
+| 文件 | 作用 |
+|---|---|
+| `docker-compose.yml` | 设备上 `/var/lib/casaos/apps/wb2api/docker-compose.yml` 的镜像拉取版 |
+| `wb2api-pull-update.sh` | **在设备上跑**：拉镜像 → 切换 image → 重建 → 冒烟 → 失败回滚 |
+| `README.md` | 本文件 |
+
+---
+
+## 为什么是 GHCR，不是 Docker Hub
+
+2026-09-19 在设备上实测的结果：
+
+| 目标 | 结果 |
+|---|---|
+| `ghcr.io` | **HTTP 401** —— registry 在线，这是未认证请求的正常响应，说明可直连 |
+| `registry-1.docker.io` | **10 秒超时** —— 直连不通，只能借 `daemon.json` 里的国内镜像源 |
+
+设备 `/etc/docker/daemon.json` 配的是 Docker Hub 的镜像源（`docker.1ms.run`、
+`docker.xuanyuan.me`），对 GHCR 无效。既然 GHCR 能直连，就用 GHCR 最省事。
+
+---
+
+## 一次性配置
+
+### 1. 把 GHCR 包设为 Public
+
+**这一步不做，设备上 `docker pull` 会 403。**
+
+首次 `build-armv7` 跑完后，去
+`https://github.com/users/Wliky/packages/container/workbuddy2api-panel/settings`
+把可见性改成 **Public**。
+
+（不想公开的话，就得在设备上 `docker login ghcr.io -u Wliky` 并输入一个
+`read:packages` 权限的 PAT。）
+
+### 2. 触发一次构建
+
+push 到 `main` 就会自动构建并推送；也可以到 Actions 页面手动跑 `build-armv7`。
+
+产出的镜像标签：
+
+| 标签 | 含义 |
+|---|---|
+| `ghcr.io/wliky/workbuddy2api-panel:armv7` | 移动标签，始终指向 main 最新（设备用这个） |
+| `:main` | 同上，语义化别名 |
+| `:sha-xxxxxxx` | 钉死某个提交，回滚到具体版本时用 |
+| `:<版本>-armv7` / `:<版本>` | 打 `v*` tag 时才有 |
+
+### 3. 切换设备上的 compose
+
+```bash
+# 在玩客云上
+cd /var/lib/casaos/apps/wb2api
+cp docker-compose.yml docker-compose.yml.before-pull-mode
+```
+
+把本仓库 `deploy/wankeyun/docker-compose.yml` 的内容覆盖进去，**唯一实质差异**是：
+
+```diff
+-        image: wb2api:local
++        image: ghcr.io/wliky/workbuddy2api-panel:armv7
+```
+
+然后：
+
+```bash
+docker pull ghcr.io/wliky/workbuddy2api-panel:armv7
+docker-compose up -d --force-recreate
+```
+
+---
+
+## 日常升级
+
+把 `wb2api-pull-update.sh` 传到设备（例如 `/root/wb2api-pull-update.sh`），然后：
+
+```bash
+bash /root/wb2api-pull-update.sh --check      # 先看有没有新版，不改动任何东西
+bash /root/wb2api-pull-update.sh              # 升级
+bash /root/wb2api-pull-update.sh --rollback   # 出问题回滚到升级前镜像
+```
+
+脚本自己会做：备份 compose/config → 拉取 → 重建 → 等 `/healthz` 通过 →
+清理悬空镜像。**任何一步失败都会自动回滚**，包括还原 compose 定义。
+
+### 自动检查更新（可选）
+
+设备上目前**没有任何 crontab**。想让它每天早上自己看一眼：
+
+```bash
+crontab -e
+```
+
+```cron
+# 每天 04:30 检查一次，有新版才升级
+30 4 * * * /bin/bash /root/wb2api-pull-update.sh >> /var/log/wb2api-update.log 2>&1
+```
+
+> 用 `--check` 更保守（只报告不升级），配合日志自己决定什么时候升。
+> 注意设备根分区只有 2.8G 可用，脚本收尾会 `docker image prune -f`。
+
+---
+
+## 权限：容器为什么以 root 运行
+
+设备上现役容器 `docker inspect` 显示 `User=[]`（即 root），
+`/DATA/AppData/wb2api/config.json` 与 `auths/` 的属主也是 `root:root`。
+
+`Dockerfile.armv7` 刻意**不写 `USER`**，与现役保持一致。
+改成非 root（比如上游 Dockerfile 的 `USER app`，uid 10001）会立刻踩到：
+
+```
+rename /app/config.json.tmp /app/config.json: permission denied
+```
+
+要长期改成非 root，就得同时 `chown -R` 数据目录并给 compose 加
+`user: "<uid>:<gid>"` —— 属于额外改动，本套配置不引入。
+
+---
+
+## 与升级前方案的关系
+
+| | 升级前（本地 build） | 现在（镜像拉取） |
+|---|---|---|
+| 构建位置 | 玩客云本机（S805，极慢） | GitHub Actions（amd64 runner 交叉编译） |
+| 升级动作 | Windows 上 `update.sh`，SFTP 传二进制 | 设备上一条 `docker pull` |
+| 需要 Windows 参与 | 是 | **否** |
+| 镜像来源 | `wb2api:local` | `ghcr.io/wliky/workbuddy2api-panel:armv7` |
+| 数据目录 | `/DATA/AppData/wb2api` | **不变** |
+
+`Dockerfile.armv7` 产出的 `/app` 布局与设备上 `wb2api:local` 逐字节同构
+（`/app/{wb2api,signin_bin,login,credit,*.sh,probe_active.py}`），
+三个挂载点 `/app/data`、`/app/auths`、`/app/config.json` 全部不变 ——
+所以这是**原地替换**：账号池、配置、用量数据一个都不会丢。
+
+旧的 `玩客云部署/update.sh` 仍然可用（`--no-pull` 跳过 git 拉取），
+在 GitHub Actions 出问题时作为兜底。
+
+---
+
+## 排错
+
+**`docker pull` 403 / unauthorized**
+→ GHCR 包还是私有的。见上面「一次性配置 1」。
+
+**拉得很慢或超时**
+→ 国内连 GHCR 时好时坏。备选：到 Actions 页面手动跑 `build-armv7` 并勾选
+`offline_tar`，下载 `wb2api-armv7-image-tar` 产物，传到设备后
+`gunzip -c wb2api-armv7.tar.gz | docker load`。
+
+**容器起来又立刻退出**
+→ `docker logs --tail 50 wb2api`。最常见原因是 `/DATA/AppData/wb2api/config.json`
+被当成目录创建了（宿主机上原本没有这个文件），`rm -rf` 该目录后用
+`cp config.example.json config.json` 重建。
+
+**CasaOS 里显示「待重建」**
+→ 容器的 `com.docker.compose.project=wb2api` 标签丢了。
+不要用 `docker run` 起容器，一律用 `docker-compose -f $APP_DIR/docker-compose.yml up -d`。
+
+**升级后域名打不开面板**
+→ 面板走根路径直达，需要配置里 `server.panel_root = true`。
+确认 `https://wb.005201.xyz/` 能开（而不是 `/panel/`）；
+再看 cloudflared 隧道 ingress 是否还指向 `localhost:7863`。
