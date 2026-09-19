@@ -178,8 +178,10 @@ jobs:
           echo "镜像架构校验通过 ✅"
 
       # 国内设备拉不动 GHCR 时用这条：导出 docker-format tar 再 docker load
+      # 用 github.event.inputs（字符串 'true'）而非 inputs 上下文 —— 后者在
+      # push / tag 事件下取值不确定。
       - name: 导出离线镜像 tar.gz
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.offline_tar || startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.offline_tar == 'true') }}
         run: |
           set -euo pipefail
           docker buildx build \
@@ -192,7 +194,7 @@ jobs:
           ls -lh /tmp/wb2api-armv7.tar.gz
 
       - name: 上传离线镜像
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.offline_tar || startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.offline_tar == 'true') }}
         uses: actions/upload-artifact@v4
         with:
           name: wb2api-armv7-image-tar

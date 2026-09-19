@@ -144,7 +144,7 @@ jobs:
           echo "已推送 $(git rev-parse --short HEAD) 到 origin/${UPSTREAM_BRANCH}"
 
       - name: 显式触发 armv7 构建（仅在未使用 PAT 时）
-        if: steps.tok.outputs.pat == 'false' && (steps.merge.outputs.merged == 'true' || inputs.force_build)
+        if: ${{ steps.tok.outputs.pat == 'false' && (steps.merge.outputs.merged == 'true' || github.event.inputs.force_build == 'true') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
