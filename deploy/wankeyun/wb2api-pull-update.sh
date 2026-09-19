@@ -8,7 +8,7 @@
 #
 #  用法：
 #      bash wb2api-pull-update.sh              # 正常升级
-#      bash wb2api-pull-update.sh --check      # 只看有没有新版本，零副作用
+#      bash wb2api-pull-update.sh --check      # 只看有没有新版本（会拉镜像比对，不改配置、不重建）
 #      bash wb2api-pull-update.sh --force      # 镜像未变也强制重建
 #      bash wb2api-pull-update.sh --backup-only# 只备份账号数据，不动服务
 #      bash wb2api-pull-update.sh --rollback   # 回滚到最近一次成功升级前的状态
@@ -28,6 +28,9 @@
 #    · 容器以 root 运行，/DATA/AppData/wb2api 下属主也是 root —— 不要改 USER。
 #    · 账号凭据在 $DATA_DIR/auths/*.json，丢了就得重新扫码登录 —— 所以
 #      **备份先行**，且冒烟阶段必须校验账号文件数量没变、账号池真的加载了。
+#    · 判断「是否需要重建」不能只比目标镜像 id：跑过一次 `--check` 后本地
+#      已有该镜像，BEFORE_ID == AFTER_ID，会误判「已是最新」而实际 compose
+#      还指着 wb2api:local。必须同时看 compose 的 image 与容器现用镜像 id。
 # ===========================================================================
 set -euo pipefail
 
@@ -205,11 +208,21 @@ if [ "$MODE" = "backup" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 1. 拉取（--check 在这里就结束，零副作用）
+# 1. 拉取（--check 在这里就结束，不改配置、不重建）
 # ---------------------------------------------------------------------------
 step "1/6 拉取镜像"
+
+# 判断「要不要重建」必须同时看三件事，只看目标镜像 id 会误判：
+#   若镜像此前已被 `--check` 或 `docker pull` 拉到本地，BEFORE_ID 就等于
+#   AFTER_ID，但 compose 里可能还是 wb2api:local、容器还跑着旧镜像 ——
+#   那种情况下比 id 会得出「已是最新，无需重建」而实际什么都没切。
+COMPOSE_IMAGE_NOW=$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$COMPOSE" | head -1)
+RUNNING_IMAGE_REF=$(docker inspect "$CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || echo "")
+RUNNING_IMAGE_ID=$(docker inspect "$CONTAINER" --format '{{.Image}}'      2>/dev/null || echo "")
 BEFORE_ID=$(img_id "$IMAGE")
-say "    本地当前  : ${BEFORE_ID:-（无）}"
+say "    compose 里的镜像 : ${COMPOSE_IMAGE_NOW:-（无）}"
+say "    容器现用镜像     : ${RUNNING_IMAGE_REF:-（无容器）} ${RUNNING_IMAGE_ID:+(${RUNNING_IMAGE_ID:0:19}...)}"
+say "    目标镜像本地 id  : ${BEFORE_ID:-（未拉取）}"
 
 if ! docker pull "$IMAGE"; then
   if [ "$MODE" = "check" ]; then
@@ -219,25 +232,29 @@ if ! docker pull "$IMAGE"; then
 fi
 
 AFTER_ID=$(img_id "$IMAGE")
-say "    远端最新  : $AFTER_ID"
+say "    目标镜像远端 id  : $AFTER_ID"
 
+# 只有「compose 已指向目标镜像」且「容器跑的就是目标镜像」才算已是最新
 SAME=0
-[ "$BEFORE_ID" = "$AFTER_ID" ] && SAME=1
+if [ "$COMPOSE_IMAGE_NOW" = "$IMAGE" ] && [ -n "$RUNNING_IMAGE_ID" ] && [ "$RUNNING_IMAGE_ID" = "$AFTER_ID" ]; then
+  SAME=1
+fi
 
 if [ "$MODE" = "check" ]; then
   if [ "$SAME" = "1" ]; then
-    step "已是最新（--check 模式，未做任何改动）"
+    step "已是最新（--check：未改配置、未重建）"
+    say "    compose 与容器都已是 $IMAGE"
   else
-    step "有新版本可用（--check 模式，未做任何改动）"
-    say "    本地: $BEFORE_ID"
-    say "    远端: $AFTER_ID"
+    step "需要重建（--check：未改配置、未重建）"
+    [ "$COMPOSE_IMAGE_NOW" = "$IMAGE" ] || say "    原因：compose 里还是 ${COMPOSE_IMAGE_NOW:-空}"
+    [ -z "$RUNNING_IMAGE_ID" ] || [ "$RUNNING_IMAGE_ID" = "$AFTER_ID" ] || say "    原因：容器跑的不是最新镜像"
   fi
   exit 0
 fi
 
 if [ "$SAME" = "1" ] && [ "$MODE" != "force" ]; then
   step "已是最新，无需重建"
-  say "    当前镜像 id 未变化（$AFTER_ID）"
+  say "    compose 与容器都已是 $IMAGE（$AFTER_ID）"
   say "    想强制重建：bash $0 --force"
   exit 0
 fi
