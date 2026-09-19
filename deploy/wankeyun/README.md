@@ -14,7 +14,7 @@
 | 文件 | 作用 |
 |---|---|
 | `docker-compose.yml` | 设备上 `/var/lib/casaos/apps/wb2api/docker-compose.yml` 的镜像拉取版 |
-| `wb2api-pull-update.sh` | **在设备上跑**：拉镜像 → 切换 image → 重建 → 冒烟 → 失败回滚 |
+| `wb2api-pull-update.sh` | **在设备上跑**：备份账号数据 → 拉镜像 → 切换 image → 重建 → 冒烟（校验账号池）→ 失败回滚 |
 | `README.md` | 本文件 |
 
 ---
@@ -61,25 +61,31 @@ push 到 `main` 就会自动构建并推送；也可以到 Actions 页面手动�
 
 ### 3. 切换设备上的 compose
 
+**推荐：直接跑脚本**，它会自己改 `image` 行、重建容器，而且会**先备份账号数据**：
+
+```bash
+bash /root/wb2api-pull-update.sh
+```
+
+**手工方式**（等同，适合想自己控制每一步的人）：
+
 ```bash
 # 在玩客云上
 cd /var/lib/casaos/apps/wb2api
 cp docker-compose.yml docker-compose.yml.before-pull-mode
+sed -i 's#^\([[:space:]]*image:\).*#\1 ghcr.io/wliky/workbuddy2api-panel:armv7#' docker-compose.yml
+docker pull ghcr.io/wliky/workbuddy2api-panel:armv7
+docker-compose up -d --force-recreate
 ```
 
-把本仓库 `deploy/wankeyun/docker-compose.yml` 的内容覆盖进去，**唯一实质差异**是：
+与设备原文件的**唯一实质差异**就是这一行：
 
 ```diff
 -        image: wb2api:local
 +        image: ghcr.io/wliky/workbuddy2api-panel:armv7
 ```
 
-然后：
-
-```bash
-docker pull ghcr.io/wliky/workbuddy2api-panel:armv7
-docker-compose up -d --force-recreate
-```
+本目录的 `docker-compose.yml` 是完整参考版（含全部原字段，可整份替换）。
 
 ---
 
@@ -88,13 +94,52 @@ docker-compose up -d --force-recreate
 把 `wb2api-pull-update.sh` 传到设备（例如 `/root/wb2api-pull-update.sh`），然后：
 
 ```bash
-bash /root/wb2api-pull-update.sh --check      # 先看有没有新版，不改动任何东西
-bash /root/wb2api-pull-update.sh              # 升级
-bash /root/wb2api-pull-update.sh --rollback   # 出问题回滚到升级前镜像
+bash /root/wb2api-pull-update.sh --check       # 先看有没有新版，零副作用
+bash /root/wb2api-pull-update.sh               # 升级
+bash /root/wb2api-pull-update.sh --list        # 看有哪些备份点
+bash /root/wb2api-pull-update.sh --rollback    # 回滚到升级前的镜像与数据
 ```
 
-脚本自己会做：备份 compose/config → 拉取 → 重建 → 等 `/healthz` 通过 →
-清理悬空镜像。**任何一步失败都会自动回滚**，包括还原 compose 定义。
+执行顺序是刻意设计的：
+
+1. **拉镜像** → 判断是否真有新版（`--check` 在这一步就退出，绝不改动任何东西）
+2. **备份账号数据**（见下一节）—— 只在确认要升级之后才做
+3. 改 compose 的 `image` 行（只动这一行，CasaOS 的其它字段一字不改）
+4. `docker-compose up -d --force-recreate`
+5. **冒烟**：容器 `running` + `/healthz` 返回 200 + **账号文件数没变** +
+   `/status` 里 `healthy > 0`（确认账号池真的加载上了，而不是只看进程活着）
+6. 清理悬空镜像
+
+**任何一步失败都会自动回滚**：还原 compose 并重建回原镜像。数据全程只挂载、不写入，
+所以回滚不会损伤账号。
+
+### 账号数据备份
+
+账号凭据在 `/DATA/AppData/wb2api/auths/*.json`。**这些文件丢了就得重新扫码登录**，
+所以脚本把「备份」放在动手之前，而且是两份冗余：
+
+| 位置 | 内容 | 用途 |
+|---|---|---|
+| `/root/wb2api-backups/<时间戳>/data.tar.gz` | 整个数据目录（auths + data + config.json） | 整体恢复 |
+| `/root/wb2api-backups/<时间戳>/auths/` | 每个账号 json 的明文副本 | 人工核对 / 单点恢复 |
+| `/root/wb2api-backups/<时间戳>/docker-compose.yml` | CasaOS 原始 compose | 回滚 |
+| `/root/wb2api-backups/<时间戳>/meta.txt` | 升级前的镜像 id、账号数、文件数 | 对账 |
+
+只想备份、不动服务：
+
+```bash
+bash /root/wb2api-pull-update.sh --backup-only
+```
+
+`--rollback` 读 `/root/wb2api-backups/last-good` 指向的那份备份，把 compose 和数据一起还原。
+**回滚本身也可逆** —— 还原前会先把当前那份另存为
+`/DATA/AppData/wb2api.before-rollback-<时间戳>`。
+
+清理旧备份（保留最近 5 份）：
+
+```bash
+ls -1dt /root/wb2api-backups/*/ | tail -n +6 | xargs -r rm -rf
+```
 
 ### 自动检查更新（可选）
 
