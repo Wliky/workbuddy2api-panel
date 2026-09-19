@@ -172,10 +172,21 @@ jobs:
       - name: 校验已推送镜像的架构
         run: |
           set -euo pipefail
-          docker buildx imagetools inspect "${{ steps.meta.outputs.image }}:armv7" | tee /tmp/inspect.txt
-          grep -q 'linux/arm/v7' /tmp/inspect.txt \
-            || { echo "::error::推送的镜像里没有 linux/arm/v7"; exit 1; }
-          echo "镜像架构校验通过 ✅"
+          IMAGE="${{ steps.meta.outputs.image }}"
+
+          # 仅作参考输出。注意：单平台镜像（本工作流 provenance=false，只推
+          # linux/arm/v7）在 registry 里是一份 image manifest 而非 index，
+          # `imagetools inspect` 不会打印 `Platform:` 行 —— 所以**不能**拿它
+          # 来 grep 架构，那样必然误报失败（本工作流第一版就踩了这个坑）。
+          docker buildx imagetools inspect "$IMAGE:armv7" || true
+
+          # 硬证据：真拉下来，读镜像 config 里的 architecture/variant
+          docker pull --platform linux/arm/v7 "$IMAGE:armv7"
+          ARCH="$(docker image inspect --format '{{.Architecture}}{{.Variant}}' "$IMAGE:armv7")"
+          echo "镜像 config 架构 = $ARCH"
+          [ "$ARCH" = "armv7" ] \
+            || { echo "::error::期望 linux/arm/v7（arm+v7），实际为 $ARCH"; exit 1; }
+          echo "镜像架构校验通过 ✅ linux/arm/v7"
 
       # 国内设备拉不动 GHCR 时用这条：导出 docker-format tar 再 docker load
       # 用 github.event.inputs（字符串 'true'）而非 inputs 上下文 —— 后者在
