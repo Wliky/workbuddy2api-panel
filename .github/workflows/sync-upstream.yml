@@ -129,10 +129,11 @@ jobs:
               if [ -n "${CONFLICTS}" ]; then
                 echo "**冲突文件**：\`${CONFLICTS}\`"
                 echo
-                echo "> 提示：\`cmd/server/main.go\` / \`cmd/server/config.go\` /"
-                echo "> \`internal/server/handler.go\` 是 fork 与上游最常撞的三处。"
-                echo "> 解冲突原则：**上游的语义优先，fork 自有的开关/兜底保留**——"
-                echo "> 典型如上游退役 \`server.max_body_mb\` 时，fork 的 \`server.panel_root\` 要留下。"
+                echo "> 提示：fork 改动已外置到 \`internal/server/fork_fixes.go\` 与"
+                echo "> \`cmd/server/fork_save.go\`（这两个文件上游从不触碰，永不会冲突）。"
+                echo "> 上游文件里只剩**最小接缝**：\`Config.PanelRoot\` 字段、\`ServeHTTP\` 首行、"
+                echo "> \`saveConfig\` 的落盘调用。若仍冲突，多半是上游在**紧邻这些接缝**的位置"
+                echo "> 增删代码 —— 通常两边都保留即可（字段都留、调用都留）。"
                 echo
               fi
               echo "**在本地解开**："
