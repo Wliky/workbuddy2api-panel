@@ -118,20 +118,35 @@ jobs:
             echo "合并成功：$(git rev-parse --short HEAD)"
           else
             echo "::error::上游更新与 fork 自有改动冲突，已回滚，未做任何推送。"
+            # 冲突文件清单要在 abort 之前取，abort 之后工作区就干净了
+            CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
             git merge --abort || true
             {
               echo "### ❌ 上游同步冲突，需要人工处理"
               echo
               echo "上游 \`${UPSTREAM_REPO}\` 的新提交与 fork 改动冲突，工作流已中止，**没有推送任何东西**。"
               echo
-              echo "本地处理："
+              if [ -n "${CONFLICTS}" ]; then
+                echo "**冲突文件**：\`${CONFLICTS}\`"
+                echo
+                echo "> 提示：\`cmd/server/main.go\` / \`cmd/server/config.go\` /"
+                echo "> \`internal/server/handler.go\` 是 fork 与上游最常撞的三处。"
+                echo "> 解冲突原则：**上游的语义优先，fork 自有的开关/兜底保留**——"
+                echo "> 典型如上游退役 \`server.max_body_mb\` 时，fork 的 \`server.panel_root\` 要留下。"
+                echo
+              fi
+              echo "**在本地解开**："
               echo
               echo '```bash'
-              echo "git remote add upstream https://github.com/${UPSTREAM_REPO}.git"
+              echo "git remote add upstream https://github.com/${UPSTREAM_REPO}.git  # 已加过可跳过"
               echo "git fetch upstream main"
-              echo "git merge upstream/main     # 解冲突"
+              echo "git merge upstream/main     # 解冲突后 commit"
+              echo "go build ./... && go test ./..."
+              echo "CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build ./cmd/server/  # 验 armv7 未被破坏"
               echo "git push origin main"
               echo '```'
+              echo
+              echo "推完后到 Actions 页手动 Run \`build-armv7\`（或用带 \`workflow\` 权限的 PAT 推，会自动触发）。"
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
