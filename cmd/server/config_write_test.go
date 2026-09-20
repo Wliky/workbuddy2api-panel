@@ -138,7 +138,7 @@ func TestMergeAndRenderPreservesUnknownKeysAndOverlays(t *testing.T) {
 		"api_key":      "k",
 		"auth_dir":     "./auths",
 		"my_hand_note": "别删我", // 用户手写未知键
-		"server":       map[string]any{"max_body_mb": 8},
+		"server":       map[string]any{"panel_root": false},
 	}
 	raw, _ := json.Marshal(base)
 	if err := os.WriteFile(cfgPath, raw, 0o600); err != nil {
@@ -161,8 +161,8 @@ func TestMergeAndRenderPreservesUnknownKeysAndOverlays(t *testing.T) {
 	if srv["panel_root"] != true {
 		t.Errorf("提交的键未生效: %v", srv)
 	}
-	if srv["max_body_mb"].(float64) != 8 {
-		t.Errorf("原有子键丢失: %v", srv)
+	if got["listen"] != ":7863" {
+		t.Errorf("兄弟顶层键丢失: %v", got["listen"])
 	}
 }
 
@@ -182,9 +182,10 @@ func TestMergeAndRenderRejectsInvalid(t *testing.T) {
 	if _, err := mergeAndRender(cfgPath, []byte(`{"cooldown":{"soft_rate":"随便写的"}}`)); err == nil {
 		t.Error("非法 soft_rate 应被拒绝")
 	}
-	// 2) max_body_mb 必须为正整数
-	if _, err := mergeAndRender(cfgPath, []byte(`{"server":{"max_body_mb":0}}`)); err == nil {
-		t.Error("max_body_mb=0 应被拒绝")
+	// 2) pool.cost_explore_interval 非法时长（上游 73fe1f8 起 server.max_body_mb 已退役，
+	//    改用同为"必须能解析成时长"的 key 占位）。
+	if _, err := mergeAndRender(cfgPath, []byte(`{"pool":{"cost_explore_interval":"乱写"}}`)); err == nil {
+		t.Error("非法 cost_explore_interval 应被拒绝")
 	}
 	// 3) prompt.mode 枚举非法
 	if _, err := mergeAndRender(cfgPath, []byte(`{"prompt":{"mode":"乱写"}}`)); err == nil {
