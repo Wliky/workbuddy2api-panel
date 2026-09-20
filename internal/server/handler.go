@@ -138,81 +138,14 @@ func NewHandler(cfg Config) *Handler {
 	return h
 }
 
-// rootProbePaths 挂根路径时**必须让出**的路径：这些是网关自身 API，不能被面板接管。
-// 其余未匹配路径（含 /、/app.js、/api/*）在 PanelRoot 开启时重写到 /panel 前缀。
+// ServeHTTP 网关入口。
 //
-// ⚠️ 这里必须显式覆盖**全部**网关路由，不能依赖 ServeMux 的匹配优先级 ——
-// ServeMux 只在"请求没被重写"时才按 pattern 具体度选择；一旦入口重写把 /v1/models
-// 变成 /panel/v1/models，网关路由就再也匹配不到了。
-// 2026-09-18 漏列 /v1/ 导致 /v1/models 与 /v1/chat/completions 全 404（面板吃掉了网关 API），
-// 已由 TestPanelRootDoesNotShadowGatewayAPI 锁死为回归测试。
-var rootProbePaths = map[string]bool{
-	"/healthz": true,
-	"/status":  true,
-}
-
-// isGatewayPath 判断请求路径是否属于网关自身 API（面板不得接管）。
-// 覆盖 /status、/healthz 与 /v1 全族（/v1/models、/v1/chat/completions…）。
-func isGatewayPath(p string) bool {
-	if rootProbePaths[p] {
-		return true
-	}
-	// /v1 及其子路径；注意 /v1x 不应被误认为网关路径。
-	return p == "/v1" || strings.HasPrefix(p, "/v1/")
-}
-
-// rewriteToPanelRoot 把根路径形态的请求重写为 /panel 前缀形态，**原地改 r**。
-//
-// 设计意图：面板 handler 内部 36 条路由与前端 app.js 的 fetch 都硬编码了 /panel 前缀，
-// 与其全量改写（易漏、且前端缓存旧版会立刻全 404），不如在入口处做一次重写 ——
-// 挂载点变成可选项，而面板内部实现零改动。
-//
-// /panel/* 原样放行（保留旧链接与文档里的地址可用）。
-func rewriteToPanelRoot(r *http.Request) {
-	p := r.URL.Path
-	if p == "/panel" || strings.HasPrefix(p, "/panel/") {
-		return // 已经是 /panel 形态，不动
-	}
-	if isGatewayPath(p) {
-		return // 让给网关 API（/healthz、/status、/v1/*）
-	}
-	if p == "/" {
-		r.URL.Path = "/panel/"
-		return
-	}
-	// /app.js → /panel/app.js；/api/overview → /panel/api/overview
-	r.URL.Path = "/panel" + p
-}
-
-// corsPreflight 处理浏览器跨域（CORS）。
-// 背景：网关与面板均为纯 Bearer 鉴权（无 Cookie 会话），放开 CORS 不存在
-// 凭据自动携带类攻击面；而面板内置的密钥测试器、以及部署在其它域名下的
-// 网页版聊天前端，都从浏览器发 fetch —— 没有 CORS 头时 OPTIONS 预检会被
-// ServeMux 以 405 拒掉，浏览器直接报 "Failed to fetch"。
-// 用 * 而非回显 Origin：无需 credentials，语义最简单且足够。
-func corsPreflight(w http.ResponseWriter, r *http.Request) bool {
-	if r.Header.Get("Origin") == "" {
-		return false
-	}
-	// 实际响应也要带 Allow-Origin（浏览器对正式请求同样校验）
-	h := w.Header()
-	h.Set("Access-Control-Allow-Origin", "*")
-	h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-	h.Set("Access-Control-Max-Age", "86400")
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return true
-	}
-	return false
-}
-
+// ⚠️ fork 对接点：corsPreflight 与 panel_root 重写已外置到 fork_fixes.go，
+// 由 forkBeforeRouting 统一调用。**保持下面这一行不变**即可与上游 forever 自动合并
+// （详见 fork_fixes.go 顶部说明）。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if corsPreflight(w, r) {
+	if forkBeforeRouting(w, r, h.cfg.PanelRoot, h.cfg.Panel != nil) {
 		return
-	}
-	if h.cfg.PanelRoot && h.cfg.Panel != nil {
-		rewriteToPanelRoot(r)
 	}
 	h.mux.ServeHTTP(w, r)
 }
