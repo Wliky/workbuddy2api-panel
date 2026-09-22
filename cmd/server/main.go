@@ -351,17 +351,46 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		return nil, err
 	}
 
-	// 3) 落盘（原子替换；rename 不可用时自动降级原地写，见 fork_save.go）。
+	// 3) 落盘（原子替换；单文件 bind mount 下 rename 会 EBUSY，自动降级原地写）。
 	//
-	// ⚠️ fork 对接点：上游此行原本是「写 tmp + os.Rename」的 8 行内联实现，
-	// 在 Docker 单文件 bind mount 下必然 EBUSY 失败。fork 换成下面这一行调用。
-	// **保持这一行不变即可与上游 forever 自动合并**（详见 fork_save.go 顶部说明）。
+	// 注：此前这一段的降级逻辑由 fork 外置在 fork_save.go（writeFileAtomicResilient）。
+	// 上游 5e1422c + ab9a162 已自行实现同一语义，且更完善 —— 降级写失败时**保留 tmp**
+	// （被 O_TRUNC 截断的挂载文件可由 tmp 手工恢复）。故 fork 侧实现已删除，直接引用上游。
 	out, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
-	if err := writeFileAtomicResilient(path, out, 0o600); err != nil {
-		return nil, err
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return nil, fmt.Errorf("write config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		// A single-file Docker bind mount cannot be renamed over its mount
+		// target (Linux returns EBUSY / "device or resource busy"). Keep the
+		// atomic path for regular files, but update the mounted file in place
+		// for this specific deployment shape.
+		if !errors.Is(err, syscall.EBUSY) {
+			return nil, fmt.Errorf("replace config: %w", err)
+		}
+		f, openErr := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if openErr != nil {
+			_ = os.Remove(tmp)
+			return nil, fmt.Errorf("replace config (bind mount fallback): %w", openErr)
+		}
+		_, writeErr := f.Write(out)
+		if writeErr == nil {
+			writeErr = f.Sync()
+		}
+		closeErr := f.Close()
+		// 写失败时保留 tmp（挂载文件已被 O_TRUNC 破坏，tmp 里是完整新内容，
+		// 可手工恢复）；写成功才清理。
+		if writeErr != nil {
+			return nil, fmt.Errorf("replace config (bind mount fallback, 完整新内容保留在 %s): %w", tmp, writeErr)
+		}
+		_ = os.Remove(tmp)
+		if closeErr != nil {
+			return nil, fmt.Errorf("replace config (bind mount fallback): %w", closeErr)
+		}
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
