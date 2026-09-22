@@ -4,14 +4,15 @@
 #  设计要点（每条都对应一个真实的坑）：
 #
 #  1. **用 merge 而不是 rebase / reset**。
-#     本 fork 有自己的提交（根路径直达面板 server.panel_root、CORS 预检、
-#     单文件 bind mount 下配置写入的 EBUSY 兜底），rebase 会重写这些提交的
-#     hash，reset 则会直接从历史里丢掉它们。merge 是唯一能既跟上上游、
-#     又保住 fork 改动的做法。
+#     本 fork 有自己的提交（根路径直达面板 server.panel_root、CORS 预检），
+#     rebase 会重写这些提交的 hash，reset 则会直接从历史里丢掉它们。
+#     merge 是唯一能既跟上上游、又保住 fork 改动的做法。
+#     （注：单文件 bind mount 的配置写入兜底已归还上游 —— 上游 5e1422c + ab9a162
+#     自行实现了同一语义，fork 侧实现已删除，故不再列为本 fork 的改动。）
 #
 #  2. **冲突时不推送、不猜**。`git merge` 失败即 `git merge --abort` 回到干净
 #     状态并以非零码退出，让人来解。自动解冲突会把两边的语义混在一起，
-#     而这个项目里 handler.go / config.go 正是 fork 与上游都会碰的文件。
+#     而这个项目里 main.go / handler.go / config.go 是 fork 与上游都会碰的文件。
 #
 #  3. **推送后用 workflow_dispatch 显式拉起构建**。
 #     GITHUB_TOKEN 触发的 push 事件不会触发其它 workflow（GitHub 的防递归设计，
@@ -129,11 +130,15 @@ jobs:
               if [ -n "${CONFLICTS}" ]; then
                 echo "**冲突文件**：\`${CONFLICTS}\`"
                 echo
-                echo "> 提示：fork 改动已外置到 \`internal/server/fork_fixes.go\` 与"
-                echo "> \`cmd/server/fork_save.go\`（这两个文件上游从不触碰，永不会冲突）。"
-                echo "> 上游文件里只剩**最小接缝**：\`Config.PanelRoot\` 字段、\`ServeHTTP\` 首行、"
-                echo "> \`saveConfig\` 的落盘调用。若仍冲突，多半是上游在**紧邻这些接缝**的位置"
-                echo "> 增删代码 —— 通常两边都保留即可（字段都留、调用都留）。"
+                echo "> 提示：fork 改动已外置到 \`internal/server/fork_fixes.go\`"
+                echo "> （该文件上游从不触碰，永不会冲突）。上游文件里只剩**最小接缝**："
+                echo "> \`Config.PanelRoot\` 字段、\`ServeHTTP\` 首行、\`NewHandler\` 的 \`PanelRoot:\` 一行、"
+                echo "> \`cmd/server/config.go\` 的 \`panel_root\` 字段。若仍冲突，多半是上游在"
+                echo "> **紧邻这些接缝**的位置增删代码 —— 通常两边都保留即可（字段都留、调用都留）。"
+                echo
+                echo "> **另一种可能**：上游自己实现了 fork 的某项改动（提交标题会与"
+                echo "> fork 改动高度重合）。此时应**引用上游、删掉 fork 版**，而不是硬解冲突。"
+                echo "> 详见仓库根目录 \`FORK.md\` 的「改动归还」章节。"
                 echo
               fi
               echo "**在本地解开**："
@@ -192,6 +197,7 @@ jobs:
             echo "| 本次是否合并 | ${{ steps.merge.outputs.merged == 'true' && '是' || '否（已是最新或冲突）' }} |"
             echo
             if [ "${{ steps.merge.outputs.merged }}" = "true" ]; then
-              echo "> fork 自有改动（panel_root / CORS / 配置写入兜底）已通过 merge 保留。"
+              echo "> fork 自有改动（panel_root / CORS）已通过 merge 保留。"
+              echo "> 若上游实现了某项 fork 改动，记得按 \`FORK.md\` 的「改动归还」处理。"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
