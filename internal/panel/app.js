@@ -517,14 +517,24 @@ $('cfgForm').onsubmit = async ev => {
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
   $('addVeil').classList.add('on');
-  // 重置到选域态：选域可见、加载/就绪/完成/错误全收，起始按钮亮起。
+  // 重置到登录标签
+  switchAddTab('login');
   $('addPick').hidden = false;
   $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
+  $('importDone').hidden = true; $('importErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   stopPoll();
 }
+function switchAddTab(tab) {
+  document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  $('addTabLogin').hidden = tab !== 'login';
+  $('addTabImport').hidden = tab !== 'import';
+}
+document.querySelectorAll('#addTabs .tab').forEach(b => {
+  b.onclick = () => switchAddTab(b.dataset.tab);
+});
 function startAddLogin() {
   const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
   $('btnStartLogin').disabled = true;
@@ -569,6 +579,31 @@ $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+$('importFile').onchange = async () => {
+  const file = $('importFile').files[0];
+  if (!file) return;
+  $('importDone').hidden = true; $('importErr').hidden = true;
+  const fd = new FormData();
+  fd.append('file', file);
+  const h = {};
+  const k = localStorage.getItem(LS_KEY);
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  try {
+    const r = await fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    $('importDone').hidden = false;
+    $('importDone').textContent = '导入完成：成功 ' + d.imported + ' 个' + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
+    if (d.errors && d.errors.length) {
+      console.warn('import errors:', d.errors);
+    }
+    loadOverview(true);
+  } catch (e) {
+    $('importErr').hidden = false;
+    $('importErr').textContent = '导入失败：' + e.message;
+  }
+  $('importFile').value = '';
+};
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
@@ -1262,14 +1297,15 @@ function renderUsage(d) {
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟');
 
-  // 卡片与表格给的是**全部历史**的累计值，只有下面的时序图按所选窗口展示。
-  //
-  // 这是后端的既定口径（Snapshot 的注释：「聚合当前全部桶。hours 控制时序返回
-  // 多少个小时点」），不是缺陷——但界面上不写明，切 24 小时 / 30 天时这几个数字
-  // 纹丝不动，就会被读成「没生效」。所以把口径差异直接写在标题栏。
-  $('usNote').textContent = '卡片为累计值（自启用起，不随窗口变化）· ' +
+  // 卡片、三张表与时序图全部按所选窗口统计（切窗口数字随之变化）；
+  // 「全部历史」含 90 天前折叠出的日桶。这里标注当前口径与数据起点。
+  const winLabel = ($('usWindow') && $('usWindow').selectedOptions[0]) ?
+    $('usWindow').selectedOptions[0].textContent.trim() : '';
+  $('usNote').textContent =
+    (winLabel ? winLabel + ' · ' : '') +
     (d.buckets || 0) + ' 个分桶' +
-    (d.file_bytes ? ' · ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
+    (d.since ? ' · 数据自 ' + d.since.replace('T', ' ') : '') +
+    (d.file_bytes ? ' · 文件 ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
 
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
     usRow(x.key.slice(0, 8), x.extra || '', x,
