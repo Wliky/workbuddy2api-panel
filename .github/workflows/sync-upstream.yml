@@ -33,8 +33,8 @@ name: sync-upstream
 
 on:
   schedule:
-    # 每 6 小时第 17 分检查一次（避开整点高峰）
-    - cron: '17 */6 * * *'
+    # 每 2 天 00:16 检查一次上游更新
+    - cron: '16 0 */2 * *'
   workflow_dispatch:
     inputs:
       force_build:
