@@ -131,6 +131,12 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -o /tmp/wb2api_arm ./cmd/se
 - **构建**：`.github/workflows/build-armv7.yml`（push 到 main 或手动触发）
 - **部署**：详见 `deploy/wankeyun/README.md`（玩客云 / CasaOS，含账号数据备份与双向回滚）
 
+> **已删除的上游 workflow（2026-09-26）**：上游 `0ccc530`（go-binaries.yml，
+> 五平台二进制发布）与 `817c4e4`（docker-ghcr.yml，多架构 GHCR 镜像）在本 fork
+> 用不上（armv7 由 build-armv7 负责，二进制发布不需要），已从 fork 删除。
+> 若日后 sync-upstream 与之冲突（上游改了这两个文件），解法：**继续删除**
+> （`git rm` 后 `git add` 冲突路径再 commit）。
+
 ## 已知事项
 
 - 上游 `73fe1f8` 起 `server.max_body_mb` 与 `WB2A_MAX_BODY_MB` **已退役**
