@@ -74,6 +74,52 @@ function dur(sec) {
   const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
   return h ? h + '时' + String(m).padStart(2, '0') + '分' : m ? m + '分' + String(s).padStart(2, '0') + '秒' : s + '秒';
 }
+function parseAPITime(value) {
+  const text = String(value || '');
+  if (!text || text.startsWith('0001-')) return 0;
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) ? ms : 0;
+}
+function fmtLocalDateTime(ms) {
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+    p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function rateLimitMeta(row, now) {
+  const model = String(row && row.model || '未知模型');
+  const kind = String(row && row.kind || 'rate_limit');
+  const resetAt = parseAPITime(row && row.reset_at);
+  const until = parseAPITime(row && row.until);
+  const deadline = resetAt || until;
+  const remaining = deadline > now ? Math.round((deadline - now) / 1000) : 0;
+  if (kind === 'model_unavailable') {
+    return {
+      model,
+      kind,
+      detail: remaining ? '预计 ' + dur(remaining) + ' 后重试' : '等待重新探测',
+      title: model + '\n模型当前不可用' + (deadline ? '\n最早重试：' + fmtLocalDateTime(deadline) : ''),
+    };
+  }
+  let detail = resetAt
+    ? '预计 ' + fmtLocalDateTime(resetAt) + ' 解封' + (remaining ? '（剩余 ' + dur(remaining) + '）' : '')
+    : (until ? '预计 ' + fmtLocalDateTime(until) + ' 恢复（剩余 ' + dur(remaining) + '）' : '预计解封时间未知');
+  const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
+  if (until && resetAt && until < resetAt) {
+    detail += ' · 网关最快 ' + dur(Math.max(0, Math.round((until - now) / 1000))) + ' 后重试';
+    title.push('网关最早重试：' + fmtLocalDateTime(until));
+  }
+  return { model, kind, detail, title: title.join('\n') };
+}
+function rateLimitRowsHtml(rows, now) {
+  const list = Array.isArray(rows) ? rows.filter(row => row && row.model) : [];
+  if (!list.length) return '';
+  return '<div class="rate-limits">' + list.map(row => {
+    const m = rateLimitMeta(row, now);
+    return '<div class="rate-limit ' + (m.kind === 'model_unavailable' ? 'model-unavailable' : '') +
+      '" title="' + esc(m.title) + '"><b>' + esc(m.model) + '</b><span>' + esc(m.detail) + '</span></div>';
+  }).join('') + '</div>';
+}
 
 function formatTokenCount(tokens) {
   if (tokens == null || tokens === '') return '—';
@@ -164,6 +210,7 @@ function renderAccounts(list) {
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
     const pct = s.credits_total > 0
@@ -188,7 +235,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
-      '<td>' + tag + note + '</td>' +
+      '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -384,7 +431,13 @@ async function loadLogs() {
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
   try {
-    const d = await api('logs');
+    const [d, metrics, requestRows] = await Promise.all([
+      api('logs'),
+      api('request_metrics').catch(() => ({})),
+      api('request_logs?limit=100').catch(() => ({ entries: [] })),
+    ]);
+    const recent = (requestRows.entries && requestRows.entries.length) ? requestRows.entries : (metrics.recent || []);
+    renderRequestMetrics(metrics, recent);
     const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
     box.innerHTML = entries.length
       ? entries.map(e => {
@@ -401,6 +454,60 @@ async function loadLogs() {
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
   } catch (e) { /* 概览已提示 */ }
+}
+
+function renderRequestMetrics(m, entries) {
+  m = m || {};
+  const a = m.archive || {};
+  $('reqSummary').textContent =
+    '已完成 ' + fmtTok(m.completed) +
+    ' · 成功 ' + (m.success_rate == null ? '—' : Number(m.success_rate).toFixed(1) + '%') +
+    ' · HTTP ' + (m.http_success_rate == null ? '—' : Number(m.http_success_rate).toFixed(1) + '%') +
+    ' · 平均 ' + fmtMs(m.avg_duration_ms) +
+    ' · 进行中 ' + String(m.in_flight || 0);
+  $('reqNote').textContent = a.enabled
+    ? 'JSONL 归档 ' + fmtBytes(a.bytes) + (a.dropped_writes ? ' · 丢弃 ' + a.dropped_writes + ' 条' : '') +
+      (a.last_error ? ' · 错误：' + a.last_error : '')
+    : '仅内存指标，JSONL 归档已关闭';
+
+  $('reqLogBox').innerHTML = (entries || []).map(requestLogLine).join('') ||
+    '<span style="color:var(--ink-3)">暂无请求记录</span>';
+}
+
+function requestLogText(e) {
+  const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+  const outcomeLabel = { success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' };
+  const token = Number(e && e.total_tokens || 0) ||
+    (Number(e && e.prompt_tokens || 0) + Number(e && e.completion_tokens || 0));
+  let credit = 'credit —';
+  if (e && e.credit_known) {
+    const value = Number(e.credit);
+    if (Number.isFinite(value)) credit = String(Number(value.toFixed(2))) + ' credit';
+  }
+  return [
+    when,
+    String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
+    e && e.model || '—',
+    e && e.account || '—',
+    fmtMs(e && e.duration_ms),
+    fmtTok(token) + ' tok',
+    credit,
+    e && e.request_id || '—',
+  ].join(' | ');
+}
+
+function requestLogLine(e) {
+  const outcome = String(e && e.outcome || '');
+  const cls = outcome === 'http_error' || outcome === 'stream_error' ? ' e'
+    : outcome === 'interrupted' ? ' w' : '';
+  return '<span class="ln' + cls + '">' + esc(requestLogText(e)) + '</span>';
+}
+
+function fmtBytes(bytes) {
+  const n = Number(bytes || 0);
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
 }
 $('btnLogPin').onclick = () => {
   logPin = !logPin;
@@ -1230,6 +1337,25 @@ function fmtMs(ms) {
   return Math.round(ms) + 'ms';
 }
 function fmtRate(r) { return r ? Number(r).toFixed(1) + ' tok/s' : '—'; }
+function trimFixed(s) {
+  if (!String(s).includes('.')) return String(s);
+  return String(s).replace(/0+$/, '').replace(/\.$/, '');
+}
+function fmtCredit(n) {
+  const v = Number(n || 0);
+  if (!Number.isFinite(v)) return '—';
+  return trimFixed(v.toFixed(2));
+}
+function fmtCreditRatio(v, samples, tokens) {
+  if (!samples || !tokens) return '—';
+  const n = Number(v || 0);
+  if (!Number.isFinite(n)) return '—';
+  return trimFixed(n.toFixed(4)) + ' / 1M';
+}
+function fmtModelRate(rate) {
+  const s = String(rate || '').trim();
+  return s ? 'x' + s : '—';
+}
 
 function usStat(v, k, cls) {
   return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
@@ -1248,9 +1374,7 @@ function usBar(prompt, completion, total) {
 }
 
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
-   withPerf 控制是否追加延迟/速率两列——只有「按账号」表的表头带这两列；
-   模型表与域表没有，多输出会造成列错位。早先靠「mid 是否为 undefined」隐式
-   判断，调用方稍一改动就会错列，故改为显式参数。 */
+   withPerf 控制延迟/速率两列；列开关显式传入，避免调用方改动后与表头错列。 */
 function usRow(name, sub, a, mid, withPerf) {
   return '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
@@ -1299,7 +1423,47 @@ function renderUsage(d) {
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
     usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
 
+  renderCreditDimensions(d);
   renderUsageChart(d.series || []);
+}
+
+function renderCreditDimensions(d) {
+  const t = d.totals || {};
+  const accounts = d.credit_by_account || [];
+  const models = d.credit_by_model || [];
+  $('usCreditStats').innerHTML =
+    usStat(fmtCredit(t.credits), '扣除积分') +
+    usStat(fmtTok(t.credit_tokens), '匹配 Token') +
+    usStat(fmtCreditRatio(t.credits_per_1m_tokens, t.credit_samples, t.credit_tokens), '平均积分 / 1M Token') +
+    usStat(String(t.credit_samples || 0), '有效积分样本');
+
+  $('usCreditNote').textContent =
+    accounts.length + ' 个账号 · ' + models.length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
+
+  $('usCreditAccBody').innerHTML = accounts.map(row => {
+    const uid = String(row.key || '');
+    const account = row.nickname || uid.slice(0, 8) || '—';
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td>' + esc(account) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
+      '<td class="num">' + fmtTok(row.requests) + '</td>' +
+      '<td class="num">' + fmtCredit(row.credits) + '</td>' +
+      '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
+      '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="6" class="empty">暂无积分扣除记录；升级前仅含 Token 的历史不会伪造积分。</td></tr>';
+
+  $('usCreditModelBody').innerHTML = models.map(row =>
+    '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td>' + esc(row.key || '—') + '</td>' +
+      '<td>' + esc(fmtModelRate(row.rate)) + '</td>' +
+      '<td class="num">' + fmtTok(row.requests) + '</td>' +
+      '<td class="num">' + fmtCredit(row.credits) + '</td>' +
+      '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
+      '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+    '</tr>'
+  ).join('') || '<tr><td colspan="7" class="empty">暂无积分扣除记录；升级前仅含 Token 的历史不会伪造积分。</td></tr>';
 }
 
 /* renderUsageChart 画堆叠柱状图。
@@ -1437,9 +1601,21 @@ function renderUsageChart(series) {
 
 function fmtTokTip(v) { return fmtTok(v); }
 
+let usageRateWarmAt = 0;
+async function warmUsageModelRates() {
+  if (Date.now() - usageRateWarmAt < 10 * 60 * 1000) return;
+  try {
+    await api('models');
+  } catch (e) {
+    // 倍率回填是可选增强；失败不阻塞用量统计，10 分钟后再试。
+  }
+  usageRateWarmAt = Date.now();
+}
+
 async function loadUsage() {
   const hours = ($('usWindow') && $('usWindow').value) || 72;
   try {
+    await warmUsageModelRates();
     const d = await api('usage?hours=' + encodeURIComponent(hours));
     renderUsage(d);
   } catch (e) {
