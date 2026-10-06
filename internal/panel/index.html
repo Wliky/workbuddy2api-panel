@@ -679,6 +679,23 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </table>
         </div>
       </div>
+
+      <div class="box">
+        <header>
+          <h3>模型锁池 <span class="hint">哪些模型不能用、还要锁多久</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="mlNote"></span>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th>模型</th><th>域</th><th>状态</th><th>可选 / 总数</th>
+            <th>锁定账号</th><th>最早解锁</th><th>全池解锁</th><th>原因</th>
+          </tr></thead>
+          <tbody id="mlBody"></tbody>
+        </table>
+        </div>
+      </div>
     </section>
 
     <!-- 任务中心 -->
@@ -944,7 +961,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="hr"></div>
             <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
               <input type="checkbox" name="include_disabled_in_tasks"></div>
-            <div class="hint">禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。</div>
+            <div class="hint">禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。<br>若只想让<b>单个</b>账号临时退出选号但保留保号，直接用账号行的「<b>暂停选号</b>」按钮（账号级，无需打开本开关）。</div>
           </div>
         </div>
 

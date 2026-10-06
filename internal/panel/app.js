@@ -217,7 +217,18 @@ function trangeQuery(id, rolling) {
     q.set('from', sec(trangeMidnight()));
     return q;
   }
-  if (st.preset === '0') return q;
+  // 全部历史：滚动端点（用量）必须**显式**传 hours=0。
+  //
+  // 后端对「什么都不给」的缺省是 72 小时（见 panel.go 的说明：
+  // 「都不给：等同于 hours=72（保持旧调用方行为）」），所以这里返回空 query 会被
+  // 当成「近 3 天」—— 正是 issue #121 报的现象：选了「全部历史」，数字却和
+  // 「近 3 天」一模一样。
+  //
+  // 非滚动端点（请求记录）没有缺省窗口：不传 from/to 即"不限起点"，保持空 query。
+  if (st.preset === '0') {
+    if (rolling) q.set('hours', '0');
+    return q;
+  }
   if (rolling) { q.set('hours', st.preset); return q; }
   q.set('from', sec(new Date(Date.now() - Number(st.preset) * 3600 * 1000)));
   return q;
@@ -368,6 +379,7 @@ function renderAccounts(list) {
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
     let cls = '', tag;
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
+    else if (s.paused) { cls = 'off'; tag = '<span class="tag warn">已暂停选号</span>'; }
     else if (cool > 0) {
       cls = 'cool';
       const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
@@ -416,10 +428,48 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
-                : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
+                : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
+                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额">暂停选号</button>')) +
+        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
+}
+
+// renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
+// 后端 model_locks 已按「整池不可用 → 没号可用 → 部分限流」排好序，这里只做展示。
+function renderModelLocks(rows) {
+  const tb = $('mlBody');
+  if (!tb) return;
+  const note = $('mlNote');
+  if (!rows || !rows.length) {
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">当前没有模型级限流 —— 所有模型均可选</div></td></tr>';
+    if (note) note.textContent = '';
+    return;
+  }
+  const STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], partial: ['warn', '部分限流'] };
+  const left = iso => {
+    const ms = parseAPITime(iso);
+    return ms ? dur(Math.max(0, Math.round((ms - Date.now()) / 1000))) : '—';
+  };
+  tb.innerHTML = rows.map(r => {
+    const st = STATE[r.state] || ['mute', r.state || '—'];
+    const realm = r.realm === 'global' ? '国际版' : '国内版';
+    return '<tr>' +
+      '<td>' + esc(r.model) + '</td>' +
+      '<td><span class="realm-tag">' + realm + '</span></td>' +
+      '<td><span class="tag ' + st[0] + '">' + st[1] + '</span></td>' +
+      '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
+      '<td class="num">' + (r.locked || 0) + '</td>' +
+      '<td class="num">' + left(r.unlock_at || r.fully_unlock_at) + '</td>' +
+      '<td class="num">' + left(r.fully_unlock_at) + '</td>' +
+      '<td>' + (r.reason ? '<div class="note">' + esc(r.reason) + '</div>' : '—') + '</td>' +
+      '</tr>';
+  }).join('');
+  if (note) {
+    const bad = rows.filter(r => r.state === 'locked' || r.state === 'starved').length;
+    note.textContent = bad ? bad + ' 个模型整池不可用' : rows.length + ' 个模型部分限流';
+  }
 }
 
 async function loadOverview(quiet) {
@@ -444,6 +494,7 @@ async function loadOverview(quiet) {
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
+    renderModelLocks(d.model_locks);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
@@ -452,7 +503,7 @@ $('accBody').addEventListener('click', async ev => {
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
-  if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。确认禁用？')) return;
+  if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
   b.disabled = true;
   try {
     if (a === 'checkin') {
@@ -467,6 +518,12 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'disable') {
       await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
       toast('已禁用', 'ok');
+    } else if (a === 'pause') {
+      await api('accounts/' + encodeURIComponent(u) + '/pause', { method: 'POST' });
+      toast('已暂停选号（签到 / 保活照常）', 'ok');
+    } else if (a === 'resume') {
+      await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
+      toast('已恢复选号', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
     } else if (a === 'remove') {
@@ -913,6 +970,19 @@ const CFG_MAP = {
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
 };
+/* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
+ *
+ * 其余文本字段保持「空 = 不下发」的既有语义——那是防误清空的保护，不是 bug：
+ * 表单里某个框没填，通常意味着"没改"，把它当成"请清空"会静默抹掉配置。
+ *
+ * 但覆盖型字段正好相反：清空 = 明确要求回到默认。漏发它们会让面板显示"已保存"
+ * 而值其实没变（issue #102 附带发现 2：user_agent 清空后 config.json 里仍是旧值）。
+ *
+ * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
+ * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
+ */
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
   let o = obj;
@@ -948,7 +1018,8 @@ function collectConfig() {
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
     else {
       const raw = el.value.trim();
-      if (raw === '') v = undefined;
+      // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
+      if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }
