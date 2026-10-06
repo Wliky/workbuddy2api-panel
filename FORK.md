@@ -37,7 +37,7 @@
 | `internal/server/handler.go` — `Config` | `PanelRoot bool` 字段 | 1 个字段（+注释） |
 | `internal/server/handler.go` — `ServeHTTP` | `if forkBeforeRouting(w, r, h.cfg.PanelRoot, h.cfg.Panel != nil) { return }` | 1 行 |
 | `cmd/server/main.go` — `NewHandler` 装配 | `PanelRoot: cfg.Server.PanelRoot,` | 1 行 |
-| `cmd/server/config.go` — `Server` 段 | `PanelRoot bool \`json:"panel_root"\`` 字段 | 1 个字段（Go 语法上无法外置） |
+| `cmd/server/config.go` — `Server` 段 | `PanelRoot bool \`json:"panel_root"\`` 字段（**与上游 `read_timeout` 共用同一个 struct**） | 1 个字段（Go 语法上无法外置） |
 
 > 落盘段（`cmd/server/main.go` 的 `saveConfig`）**已不再是接缝** —— 见「改动归还」。
 
@@ -106,14 +106,54 @@ git merge-tree --write-tree --messages HEAD origin/main   # rc=1 → 有冲突
 
 ## 上游同步
 
-自动化：`.github/workflows/sync-upstream.yml`（每 6 小时检查一次，也可手动触发）。
+自动化：`.github/workflows/sync-upstream.yml`（定时 **每 2 天 00:16 UTC** 检查一次，也可手动触发）。
 
 - 上游无更新 → 不动
-- 上游有更新且**能自动合并** → merge（保留 fork 提交）→ 推送 → 触发 armv7 构建
-- 上游有更新但**冲突** → `merge --abort` 回滚、**不推送**，并在 Actions 摘要里列出冲突文件与解法
+- 上游有更新且**能自动合并** → merge（保留 fork 提交）→ **编译闸门** → 推送 → 触发 armv7 构建
+- 上游有更新但**文本冲突** → `merge --abort` 回滚、**不推送**，Actions 摘要里列出冲突文件与解法
+- 上游有更新、文本能合并但**编译不过** → 不推送，摘要里给出本地复现步骤
 
 > 注意：fork 的提交会保留。**绝不要**点 GitHub 网页上的 `Sync fork` →
 > `Discard N commits`（那会删掉本 fork 全部改动）。
+
+### ⚠️ 两个已踩过的坑（2026-10-06 修复，别再踩）
+
+**坑 1：`gh` 会把「当前仓库」解析成上游，而不是本 fork。**
+
+`gh workflow run ...` 靠 git remote 推断当前仓库，而它的排序是
+`remoteNameSortScore`：**`upstream`(3) > `github`(2) > `origin`(1)**，无 `gh-resolved`
+配置时取排序后的第一个。`sync-upstream` 为了合并上游恰好执行了
+`git remote add upstream ...` → gh 优先选它 → 跑到**上游**仓库找 build-armv7.yml：
+
+```
+HTTP 404: workflow build-armv7.yml not found on the default branch
+(https://api.github.com/repos/linguo2625469/workbuddy2api-panel/actions/workflows/build-armv7.yml)
+```
+
+重试 5 次必然全失败（这就是 2026-09-29 / 2026-10-05 两次 sync-upstream 失败的原因 ——
+**合并与推送其实都成功了，只是镜像没被重建**）。
+
+**解法**：给这一步设 `GH_REPO: ${{ github.repository }}`。`GH_REPO` 在 gh 的仓库解析里
+优先级最高（`repository.Current()` 第一件事就是读它），直接绕过 remote 推断。
+
+**坑 2：合并不冲突 ≠ 合并可用。**
+
+git 的自动合并只看文本。双方「各加一段」不算冲突，但结果可能是**语义重复**：
+
+- 上游给 `Config.Server` 加 `read_timeout`（issue #100），fork 的同名字段是 `panel_root`
+- 两边都表现为「新增」，git 全部保留 → `Config` 里出现**两个 `Server` 字段**
+- 编译期报 `Server redeclared`，但**没有冲突、没有告警**，直接推上了 main
+
+2026-10-05 的自动合并就是这样把 main 弄坏的，又因坑 1 导致 build 没触发，
+**结果坏了 4 天无人发现**。
+
+**解法**（两层）：
+
+1. `sync-upstream` 推送前跑 `go build ./...`，失败即中止、不推送
+2. 本地合并后**务必**跑「手工解冲突后的必做验证」那一节
+
+> 排查这类问题的快捷判据：**main 上某个上游版本号没对应的 build-armv7 成功记录**，
+> 或者本地 `go build ./...` 直接报重名/未定义。
 
 ## 手工解冲突后的必做验证
 
@@ -140,7 +180,9 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -o /tmp/wb2api_arm ./cmd/se
 ## 已知事项
 
 - 上游 `73fe1f8` 起 `server.max_body_mb` 与 `WB2A_MAX_BODY_MB` **已退役**
-  （请求体不再由网关预拦截）。本 fork 的 `config.go` 里 `Server` 段只保留 `panel_root`。
+  （请求体不再由网关预拦截）。fork 的 `Config.Server` 段现为 **`panel_root`（fork）
+  + `read_timeout`（上游 issue #100）共用同一个 struct** —— 改动时务必只保留一个
+  `Server` 段，别再出现坑 2。
 - `README.md` 是**上游文件**（「与上游的差异」章节由上游维护），fork 对它零改动 ——
   fork 的说明请写在本文件里，别往 README 里塞。
 
