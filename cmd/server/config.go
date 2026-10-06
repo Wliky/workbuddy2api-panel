@@ -30,7 +30,18 @@ type Config struct {
 		//
 		// MaxBodyMB 已随上游 73fe1f8 退役（请求体不再由网关预拦截，交上游自然响应），
 		// 故本段只保留 fork 自有的 panel_root；旧 config 里的该键由未知键容忍忽略。
+		//
+		// ⚠️ fork 与上游共用这一个 server 段：上游 2026-10 加了 read_timeout（issue #100），
+		// 自动合并曾因两边各自"新增"同名段而**静默**产出两个 Server 字段（编译失败，
+		// 见 sync-upstream 的编译闸门）。改动本段时务必只保留**一个** Server struct。
 		PanelRoot bool `json:"panel_root"`
+
+		// ReadTimeout 入站请求读取（含 body 上传）总时长上限（issue #100）。
+		// http.Server 的 ReadTimeout 覆盖整个请求读取：大上下文/文件块请求经
+		// 反代链转发时上传可超过旧固定值 60s，被掐后客户端拿到
+		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
+		//（慢速 body 可无限占用连接，自担风险）；改动需重启进程。
+		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
 	} `json:"server"`
 
 	Panel struct {
@@ -54,15 +65,6 @@ type Config struct {
 		// 热生效（经 livecfg 快照），无需重启。
 		RequestClientInfo bool `json:"request_client_info"`
 	} `json:"logging"`
-
-	Server struct {
-		// ReadTimeout 入站请求读取（含 body 上传）总时长上限（issue #100）。
-		// http.Server 的 ReadTimeout 覆盖整个请求读取：大上下文/文件块请求经
-		// 反代链转发时上传可超过旧固定值 60s，被掐后客户端拿到
-		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
-		//（慢速 body 可无限占用连接，自担风险）；改动需重启进程。
-		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
-	} `json:"server"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：

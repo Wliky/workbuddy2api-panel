@@ -13,6 +13,7 @@
 #  2. **冲突时不推送、不猜**。`git merge` 失败即 `git merge --abort` 回到干净
 #     状态并以非零码退出，让人来解。自动解冲突会把两边的语义混在一起，
 #     而这个项目里 main.go / handler.go / config.go 是 fork 与上游都会碰的文件。
+#     **但"没冲突"不等于"能编译"** —— 合并成功后还有一道编译闸门（见第 6 点）。
 #
 #  3. **推送后用 workflow_dispatch 显式拉起构建**。
 #     GITHUB_TOKEN 触发的 push 事件不会触发其它 workflow（GitHub 的防递归设计，
@@ -23,6 +24,20 @@
 #
 #  4. **本工作流只监听 schedule / workflow_dispatch**，不监听 push —— 从根上
 #     杜绝「同步 → push → 再同步」的循环。
+#
+#  5. **触发构建时必须用 GH_REPO 钉死仓库**。gh 靠 git remote 推断"当前仓库"，
+#     而它的优先顺序是 upstream(3) > github(2) > origin(1)；本工作流为了合并上游
+#     刚好 `git remote add upstream ...`，于是 gh 会优先选中 upstream，把仓库解析成
+#     linguo2625469/workbuddy2api-panel → 那里没有 build-armv7.yml →
+#     `HTTP 404: workflow build-armv7.yml not found on the default branch`。
+#     （2026-09-29、2026-10-05 两次失败同因，且重试 5 次必然全失败。）
+#     GH_REPO 在 gh 的仓库解析里优先级最高，直接绕过 remote 推断。
+#
+#  6. **推送前必须过编译闸门**。git 的自动合并只看文本：上游与 fork「各加一段」
+#     不算冲突，但结果可能是语义重复。2026-10-05 就这样把编译不过的代码推上了
+#     main（Config 里出现两个 Server struct：fork 的 panel_root 撞上游的 read_timeout）
+#     —— 而 build-armv7 又因第 5 点没被触发，于是没人发现，镜像整整 4 天没更新。
+#     现在 `go build ./...` 失败即中止、不推送。
 #
 #  可选配置：
 #     secrets.SYNC_PAT —— 一个 fine-grained PAT（contents: read/write, actions: write）。
@@ -157,6 +172,49 @@ jobs:
             exit 1
           fi
 
+      - name: 准备 Go（供编译闸门使用）
+        if: steps.merge.outputs.merged == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # git 的自动合并只看文本：两边「各加一段」不冲突，但结果可能是
+      # **语义重复**（最典型：上游与 fork 各自往 Config 里加了一个 `Server struct`，
+      # 于是 Config 出现两个同名字段 → Server redeclared）。2026-10-05 的自动合并
+      # 就是这么把编译不过的代码推上 main 的（fork 的 panel_root 撞上游的 read_timeout）。
+      # 因此合并不冲突 ≠ 合并可用 —— 推之前必须真编一次。
+      - name: 编译闸门 —— 合并结果必须能编译
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          if go build ./... ; then
+            echo "✅ 编译闸门通过：合并结果可以编译"
+          else
+            echo "::error::自动合并后的代码编译失败，已中止，未推送任何东西。"
+            {
+              echo "### ❌ 自动合并成功但编译失败，已中止"
+              echo
+              echo "git 无文本冲突，但合并结果**编译不过** —— 多半是上游与 fork"
+              echo "各自新增了同名结构/字段（语义重复），git 察觉不到。"
+              echo
+              echo "**已知先例**：\`cmd/server/config.go\` 的 \`Config\` 里出现两个 \`Server struct\`"
+              echo "（fork 的 \`panel_root\` 与上游的 \`read_timeout\`）→ \`Server redeclared\`。"
+              echo
+              echo "**在本地解开**："
+              echo
+              echo '```bash'
+              echo "git fetch origin main && git merge origin/main   # 会有\"干净\"但坏的合并"
+              echo "go build ./...                                   # 复现失败"
+              echo "# 修好后（例如把两个 Server 段合成一个）再提交"
+              echo "git push origin main"
+              echo '```'
+              echo
+              echo "推完 build-armv7 会被 push 事件自动触发（用 PAT 推的话）。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
       - name: 推送合并结果
         if: steps.merge.outputs.merged == 'true'
         run: |
@@ -168,6 +226,16 @@ jobs:
         if: ${{ steps.tok.outputs.pat == 'false' && (steps.merge.outputs.merged == 'true' || github.event.inputs.force_build == 'true') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ⚠️ 必须显式钉死仓库，否则 gh 会去操作**上游**仓库！
+          #    原因：gh 用 git remote 推断当前仓库，而它的排序规则是
+          #    remoteNameSortScore —— upstream=3 > github=2 > origin=1。
+          #    上面的「拉取上游」步骤 `git remote add upstream ...` 恰好加了一个
+          #    名叫 upstream 的 remote，于是 gh 优先选中它，把仓库解析成
+          #    linguo2625469/workbuddy2api-panel；那个仓库里没有 build-armv7.yml
+          #    → `HTTP 404: workflow build-armv7.yml not found on the default branch`
+          #    （2026-09-29 / 2026-10-05 两次失败都是这个原因，重试 5 次必然全失败）。
+          #    GH_REPO 在 gh 的仓库解析里优先级最高，直接绕过 remote 推断。
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # 刚推送完，GitHub 侧的 ref 可能还没完全可见，重试几次
