@@ -53,6 +53,10 @@ type Config struct {
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
 	Panel http.Handler
 
+	// PanelRoot fork 自有：为 true 时把根路径（/、/app.js、/api/*）重写到 /panel
+	// 前缀，实现「域名根路径直达面板」。实现见 fork_fixes.go。
+	PanelRoot bool
+
 	// Live 运行期可变配置（面板在线改 api_key / soft_rate / 脱敏开关时立即生效）。
 	// nil 时回退静态字段（测试与裸用场景）。
 	Live *livecfg.Holder
@@ -236,6 +240,11 @@ func isChatEntry(path string) bool {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// ⚠️ fork 接缝：根路径直达面板的路径重写，全部逻辑在 fork_fixes.go。
+	// 上游改本文件时只要不动这两行，sync-upstream 即自动合并。
+	if forkBeforeRouting(w, r, h.cfg.PanelRoot, h.cfg.Panel != nil) {
+		return
+	}
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && isChatEntry(r.URL.Path) {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {

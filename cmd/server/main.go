@@ -445,10 +445,12 @@ func main() {
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
 		Panel:        pn,
-		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
+		// fork 自有：根路径直达面板（server.panel_root=true 时 / → 面板首页）。
+		PanelRoot:  cfg.Server.PanelRoot,
+		Live:       live,
+		Usage:      rec,
+		RequestLog: requestLog,
+		PromptMode: cfg.Prompt.Mode,
 		// 模型降级路由表：读 live 快照（支持面板热更，改完即生效、无需重启）。
 		ModelFallback: func() map[string]string { return live.Load().ModelFallback },
 		PromptText:    cfg.PromptText,

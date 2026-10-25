@@ -47,21 +47,45 @@ jobs:
           go-version-file: go.mod
           cache: false
 
+      - name: 取上游最新 release 版本号
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 面板的更新检测（internal/updater）拿 appVersion 与上游 release tag 比较，
+          # 且 parseVersion 只认 "YYYY.M.D.HMM" 四段格式 —— 塞 git sha 会解析失败，
+          # status.UpdateAvailable 恒为 true，面板就会一直提示「有新版本」。
+          # 这里直接取上游最新 release tag 当版本号，做到**与上游同版本、不误报**。
+          TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/misakano7545/workbuddy2api-panel/releases/latest" \
+                | jq -r '.tag_name // empty' 2>/dev/null || true)
+          if ! printf '%s' "$TAG" | grep -Eq '^v?[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{3,4}$'; then
+            # 取不到（限流/网络）就退回构建时间，仍是合法的时间版本格式
+            TAG="v$(date -u +%Y.%-m.%-d.%-H%M)"
+            echo "上游 release 取不到或格式不符，回退构建时间：${TAG}"
+          else
+            echo "上游最新 release：${TAG}"
+          fi
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+
       - name: 构建四个二进制（GOARCH=arm GOARM=7 CGO_ENABLED=0）
         env:
           GOOS: linux
           GOARCH: arm
           GOARM: "7"
           CGO_ENABLED: "0"
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          SHORT="${GITHUB_SHA::7}"
+          echo "appVersion = ${VERSION}"
           mkdir -p dist
           for pair in "server:wb2api" "signin:signin_bin" "login:login" "credit:credit"; do
             cmd="${pair%%:*}"; out="${pair##*:}"
             echo "building $out <- ./cmd/$cmd"
             go build -trimpath \
-              -ldflags="-s -w -X main.appVersion=${SHORT}" \
+              -ldflags="-s -w -X main.appVersion=${VERSION}" \
               -o "dist/$out" "./cmd/$cmd"
           done
           ls -lh dist

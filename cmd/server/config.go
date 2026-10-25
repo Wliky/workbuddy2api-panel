@@ -69,6 +69,9 @@ type Config struct {
 		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
 		//（慢速 body 可无限占用连接，自担风险）；改动需重启进程。
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+		// PanelRoot fork 自有：true 时管理面板同时挂在根路径（域名根直达面板，
+		// 地址栏不出现 /panel）。缺省 false = 只挂 /panel/。改动需重启进程。
+		PanelRoot bool `json:"panel_root"`
 	} `json:"server"`
 
 	Cooldown struct {
