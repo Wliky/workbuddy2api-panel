@@ -1,0 +1,44 @@
+# ===========================================================================
+#  armv7 专用镜像（预编译产物 COPY，镜像内不跑 go build）
+#
+#  为什么不用上游 Dockerfile：
+#    上游是 `golang:1.26.10-alpine` 多阶段，直接 `--platform linux/arm/v7` 构建时
+#    QEMU 会以 armv7 模拟方式跑整条 `go build`（4 个二进制 + go:embed 前端），
+#    在 GitHub runner 上通常要 15 分钟以上，极易超时。
+#    本文件对应的 workflow 先在 amd64 上原生交叉编译（CGO_ENABLED=0，零障碍），
+#    镜像只做 COPY —— 与上游 Dockerfile 的最终层**逐项同构**：
+#      /app/{wb2api,signin_bin,login,credit}  /app/*.sh  /app/scripts/probe_active.py
+#      /app/config.json(example)  USER app(10001)  EXPOSE 7863  HEALTHCHECK /healthz
+#    上游改 Dockerfile 时要同步核对本文件（见 FORK.md 的「同步检查清单」）。
+# ===========================================================================
+FROM alpine:3.20
+
+# python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
+RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
+ && adduser -D -u 10001 app \
+ && mkdir -p /app/auths /app/data \
+ && chown -R app:app /app
+
+WORKDIR /app
+
+# 交叉编译产物（workflow 的 build job 上传为 artifact，image job 取回到 dist/）
+COPY dist/wb2api dist/signin_bin dist/login dist/credit /app/
+COPY login.sh signin.sh credit.sh /app/
+COPY scripts/probe_active.py /app/scripts/probe_active.py
+
+# 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
+COPY config.example.json /app/config.json
+
+# 去 CRLF（Windows 检出可能性）+ 补执行位。以 root 完成，app 对 root 所有文件无写权限。
+RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh \
+ && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh \
+ && chmod 755 /app/wb2api /app/signin_bin /app/login /app/credit \
+ && chown app:app /app/wb2api /app/signin_bin /app/login /app/credit
+
+USER app
+EXPOSE 7863
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
+  CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1
+
+ENTRYPOINT ["/app/wb2api", "-config", "/app/config.json"]

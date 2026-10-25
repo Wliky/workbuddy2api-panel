@@ -1,0 +1,227 @@
+# ===========================================================================
+#  上游同步：检查 misakano7545/workbuddy2api-panel 是否有新提交，有则合并
+#
+#  设计要点（每条都对应一个真实的坑）：
+#
+#  1. **用 merge，不用 rebase / reset**。fork 自有提交只有「新增文件」，merge 是
+#     唯一能既跟上上游又不丢 fork 改动的做法。重置（Sync fork → Discard commits）
+#     会把 Dockerfile.armv7 / 本工作流 / FORK.md 全抹掉。
+#
+#  2. **冲突不猜**。git merge 失败即中止；唯一自动解决的例外是「fork 删除了上游
+#     CI 文件、上游又改了它」这种 modify/delete —— 那是预期内的，直接 git rm。
+#
+#  3. **每次合并后强制清掉上游 CI**。本 fork 只保留 build-armv7 + sync-upstream。
+#     上游的 docker-ghcr.yml 会往**同一个包名**推 amd64/arm64 的 :main/:latest，
+#     与本 fork 的 armv7 标签互相覆盖 —— 设备拉到 amd64 镜像会直接起不来。
+#     binaries.yml（五平台 release）与 autobot.yml（AI 自动开 PR）同样不需要。
+#
+#  4. **推送前必须过编译闸门**。git 只看文本，"各加一段"不冲突但可能语义重复；
+#     2026-10-05 在上一个 fork 上就因此把编译不过的代码推上了 main。
+#
+#  5. **推送后用 workflow_dispatch 显式拉起构建**。GITHUB_TOKEN 触发的 push 事件
+#     不会触发其它 workflow（防递归），必须显式 dispatch，否则镜像不更新。
+#
+#  6. **dispatch 时必须用 GH_REPO 钉死仓库**。gh 按 remote 名推断仓库，优先级
+#     upstream(3) > github(2) > origin(1)；本工作流刚 `git remote add upstream`，
+#     gh 会把仓库解析成**上游** → `HTTP 404: workflow build-armv7.yml not found`
+#     （上一个 fork 上 2026-09-29 / 10-05 两次失败同因）。
+#
+#  可选 secrets.SYNC_PAT：配了就用 PAT 推送（会自动触发后续 workflow，跳过 dispatch）。
+# ===========================================================================
+
+name: sync-upstream
+
+on:
+  schedule:
+    # 每 2 天 00:26 UTC（北京时间 08:26）检查一次
+    - cron: '26 0 */2 * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '即使上游无更新，也重新构建一次镜像'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: misakano7545/workbuddy2api-panel
+  UPSTREAM_BRANCH: main
+  # fork 明确不要的上游文件（删掉它们，否则会与本 fork 的 armv7 镜像互相覆盖）
+  DROP_PATHS: >-
+    .github/workflows/docker-ghcr.yml
+    .github/workflows/binaries.yml
+    .github/workflows/autobot.yml
+    AutoBot.yml
+
+jobs:
+  sync:
+    name: 检查并合并上游更新
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出 fork 的 main（完整历史）
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: 判断是否走的 PAT
+        id: tok
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          if [ -n "$SYNC_PAT" ]; then echo "pat=true" >> "$GITHUB_OUTPUT"
+          else echo "pat=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: 配置 git 身份
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 拉取上游
+        id: fetch
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          SHA=$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")
+          echo "upstream_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "上游 ${UPSTREAM_BRANCH} 当前为 ${SHA}"
+
+      - name: 比较差异
+        id: diff
+        run: |
+          set -euo pipefail
+          BEHIND=$(git rev-list --count HEAD.."upstream/${UPSTREAM_BRANCH}")
+          AHEAD=$(git rev-list --count "upstream/${UPSTREAM_BRANCH}"..HEAD)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+          echo "落后上游 $BEHIND 个提交；fork 自有提交 $AHEAD 个"
+          [ "$BEHIND" != "0" ] && git log --oneline HEAD.."upstream/${UPSTREAM_BRANCH}" | head -30 || true
+
+      - name: 合并上游
+        id: merge
+        if: steps.diff.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          if git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            echo "合并成功：$(git rev-parse --short HEAD)"
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 冲突：只容忍「fork 删除了、上游又改了」的 CI 文件（modify/delete）
+          CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+          echo "冲突文件：${CONFLICTS:-<none>}"
+          UNKNOWN=""
+          for f in $CONFLICTS; do
+            case " ${DROP_PATHS//[$'\n']/ } " in
+              *" $f "*) ;;
+              *) UNKNOWN="$UNKNOWN $f" ;;
+            esac
+          done
+          if [ -n "$UNKNOWN" ] || [ -z "$CONFLICTS" ]; then
+            echo "::error::上游与 fork 出现非预期冲突（$UNKNOWN），已回滚，未推送。"
+            git merge --abort || true
+            {
+              echo "### ❌ 上游同步冲突，需人工处理"
+              echo
+              echo "冲突文件：\`$CONFLICTS\`"
+              echo
+              echo "在本地解开："
+              echo '```bash'
+              echo "git fetch upstream && git merge upstream/main"
+              echo "go build ./...        # 合并干净 ≠ 能编译，必须验证"
+              echo "git push origin main"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          for f in $CONFLICTS; do git rm -f "$f"; done
+          git commit --no-edit -m "sync: 丢弃上游 CI 文件（本 fork 用自己的 build-armv7）"
+          echo "已按预期丢弃上游 CI 冲突，合并完成：$(git rev-parse --short HEAD)"
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+
+      - name: 确保上游 CI 文件不存在于本 fork
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          CHANGED=0
+          for f in $DROP_PATHS; do
+            if [ -e "$f" ]; then
+              git rm -f "$f"
+              CHANGED=1
+            fi
+          done
+          if [ "$CHANGED" = "1" ]; then
+            git commit -m "sync: 移除上游 CI（docker-ghcr/binaries/autobot）"
+            echo "已移除上游 CI 文件并提交"
+          else
+            echo "上游 CI 文件本就不在，无需处理"
+          fi
+
+      - name: 准备 Go（编译闸门）
+        if: steps.merge.outputs.merged == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: 编译闸门 —— 合并结果必须能编译
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          go mod download
+          if go build ./...; then
+            echo "✅ 编译闸门通过"
+          else
+            echo "::error::自动合并后的代码编译失败，已中止，未推送。"
+            { echo "### ❌ 合并成功但编译失败"; echo; echo "git 无文本冲突但语义重复（同名结构/字段）。本地执行 \`go build ./...\` 复现并修复。"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: 推送合并结果
+        if: steps.merge.outputs.merged == 'true'
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${UPSTREAM_BRANCH}"
+          echo "已推送 $(git rev-parse --short HEAD)"
+
+      - name: 显式触发 armv7 构建（未使用 PAT 时）
+        if: ${{ steps.tok.outputs.pat == 'false' && (steps.merge.outputs.merged == 'true' || github.event.inputs.force_build == 'true') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            if gh workflow run build-armv7.yml --ref "${UPSTREAM_BRANCH}"; then
+              echo "已触发 build-armv7"; exit 0
+            fi
+            echo "触发失败（第 $i 次），5 秒后重试..."; sleep 5
+          done
+          echo "::error::无法触发 build-armv7，请手动到 Actions 运行"
+          exit 1
+
+      - name: 写入摘要
+        if: always()
+        run: |
+          {
+            echo "## 上游同步结果"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 | \`${UPSTREAM_REPO}\` |"
+            echo "| 上游 HEAD | \`${{ steps.fetch.outputs.upstream_sha || '未取到' }}\` |"
+            echo "| 落后提交数 | ${{ steps.diff.outputs.behind || 'n/a' }} |"
+            echo "| fork 自有提交 | ${{ steps.diff.outputs.ahead || 'n/a' }} |"
+            echo "| 本次合并 | ${{ steps.merge.outputs.merged == 'true' && '是' || '否（已最新或冲突）' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,196 @@
+# ===========================================================================
+#  armv7（linux/arm/v7）构建 + GHCR 镜像发布
+#
+#  上游 misakano7545/workbuddy2api-panel 只发 amd64/arm64 镜像，armv7 必须自建。
+#
+#  两条路线，这里选 B：
+#    A. 直接用上游 Dockerfile + buildx --platform linux/arm/v7
+#       → QEMU 里跑完整 go build（4 个二进制 + go:embed 前端），15 分钟起、易超时
+#    B. amd64 上原生交叉编译（CGO_ENABLED=0）→ Dockerfile.armv7 只做 COPY
+#       → 2~3 分钟，且产物架构可以用 readelf 硬校验
+#
+#  触发：push main / 打 v* tag / 手动 dispatch
+#  产物：:armv7（设备用）/ :main / :sha-<7位>；打 tag 时额外 :<版本> / :<版本>-armv7
+# ===========================================================================
+
+name: build-armv7
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      offline_tar:
+        description: '额外导出离线镜像 tar.gz（供 docker load）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+# 同分支串行；:armv7 是移动标签，新推送取消旧构建
+concurrency:
+  group: build-armv7-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 交叉编译 armv7
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: 构建四个二进制（GOARCH=arm GOARM=7 CGO_ENABLED=0）
+        env:
+          GOOS: linux
+          GOARCH: arm
+          GOARM: "7"
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          SHORT="${GITHUB_SHA::7}"
+          mkdir -p dist
+          for pair in "server:wb2api" "signin:signin_bin" "login:login" "credit:credit"; do
+            cmd="${pair%%:*}"; out="${pair##*:}"
+            echo "building $out <- ./cmd/$cmd"
+            go build -trimpath \
+              -ldflags="-s -w -X main.appVersion=${SHORT}" \
+              -o "dist/$out" "./cmd/$cmd"
+          done
+          ls -lh dist
+
+      - name: 校验 ELF 架构（必须是 EM_ARM）
+        run: |
+          set -euo pipefail
+          for f in dist/*; do
+            file "$f"
+            if ! readelf -h "$f" | grep -qE 'Machine:.*ARM'; then
+              echo "::error file=$f::$f 不是 ARM 产物，构建中止"
+              exit 1
+            fi
+          done
+          echo "四个产物均为 EM_ARM ✅"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wb2api-armv7
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  image:
+    name: 推送 GHCR 镜像
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wb2api-armv7
+          path: dist
+
+      - name: 校验取回的产物
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          for f in wb2api signin_bin login credit; do
+            test -f "dist/$f" || { echo "::error::dist/$f 缺失"; exit 1; }
+          done
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像名与标签
+        id: meta
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"   # GHCR 要求全小写
+          SHORT="${GITHUB_SHA::7}"
+          {
+            echo "image=$IMAGE"
+            echo "tags<<__TAGS__"
+            echo "$IMAGE:armv7"
+            echo "$IMAGE:main"
+            echo "$IMAGE:sha-$SHORT"
+            if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+              echo "$IMAGE:${GITHUB_REF_NAME#v}-armv7"
+              echo "$IMAGE:${GITHUB_REF_NAME#v}"
+            fi
+            echo "__TAGS__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.armv7
+          platforms: linux/arm/v7
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # 关掉 provenance / sbom：否则多出 attestation 清单，
+          # 设备上的 Docker 20.10.24 拉取时容易出错
+          provenance: false
+          sbom: false
+
+      - name: 校验已推送镜像的架构
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.meta.outputs.image }}"
+          # 单平台 manifest 不是 index，imagetools inspect 不会打印 Platform 行，
+          # 不能用它 grep 架构（会误报）。硬证据 = 拉下来读镜像 config。
+          docker buildx imagetools inspect "$IMAGE:armv7" || true
+          docker pull --platform linux/arm/v7 "$IMAGE:armv7"
+          ARCH="$(docker image inspect --format '{{.Architecture}}{{.Variant}}' "$IMAGE:armv7")"
+          echo "镜像 config 架构 = $ARCH"
+          [ "$ARCH" = "armv7" ] \
+            || { echo "::error::期望 linux/arm/v7（arm+v7），实际为 $ARCH"; exit 1; }
+          echo "镜像架构校验通过 ✅ linux/arm/v7"
+
+      - name: 导出离线镜像 tar.gz
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.offline_tar == 'true') }}
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file ./Dockerfile.armv7 \
+            --platform linux/arm/v7 \
+            --provenance=false \
+            --output type=docker,dest=/tmp/wb2api-armv7.tar \
+            .
+          gzip -9 /tmp/wb2api-armv7.tar
+          ls -lh /tmp/wb2api-armv7.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.offline_tar == 'true') }}
+        with:
+          name: wb2api-armv7-image-tar
+          path: /tmp/wb2api-armv7.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 写入摘要
+        run: |
+          {
+            echo "### 镜像已推送"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "设备侧：\`docker pull ${{ steps.meta.outputs.image }}:armv7\`"
+            echo
+            echo "> 首次推送后请在 Packages 里把该包可见性设为 **Public**，否则设备需 docker login。"
+          } >> "$GITHUB_STEP_SUMMARY"
