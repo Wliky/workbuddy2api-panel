@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -43,6 +44,32 @@ import (
 var appVersion = "dev"
 var appRepository = "misakano7545/workbuddy2api-panel"
 
+// insecureKeyWarning 空 api_key = 完全不鉴权（httpauth.VerifyBearer 对空 key 恒放
+// 行），样例占位符 test_key = 人尽皆知的弱密钥；叠加非回环监听（缺省 ":7863" 绑
+// 所有网卡）等于把网关与面板 API 暴露给整个内网/公网。返回非空告警文本供启动日志
+// 打印，安全状态返回空串。首启自动生成的随机 key 不会命中——这是给「照抄样例 /
+// 显式清空」的最后提醒，不阻塞启动。
+func insecureKeyWarning(listen, apiKey string) string {
+	if apiKey != "" && apiKey != "test_key" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		host = listen // 非 host:port 形态：按具名地址保守处理（继续告警）
+	}
+	switch {
+	case host == "", host == "0.0.0.0", host == "::":
+		// 空 host = 所有网卡，维持告警
+	case host == "127.0.0.1", host == "::1", strings.EqualFold(host, "localhost"):
+		return "" // 只听回环：暴露面有限，不打扰
+	}
+	what := "为空（网关与面板完全不鉴权）"
+	if apiKey != "" {
+		what = "为样例占位符 test_key"
+	}
+	return fmt.Sprintf("api_key %s，且监听 %s 非回环地址——对外无有效鉴权，请尽快修改配置里的 api_key", what, listen)
+}
+
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
 func usagePathFor(stateFile string) string { return stateSibling(stateFile, "usage.json") }
@@ -66,9 +93,11 @@ func main() {
 		return
 	}
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
-	// 实际生效的配置路径：下面退回「默认+env」时清空，免得启动横幅报了份没读到的文件（issue #155）。
-	loadedFrom := *cfgPath
 	flag.Parse()
+	// 实际生效的配置路径。必须在 flag.Parse() **之后**取值：flag.String 返回的指针
+	// 在 Parse 时才写入命令行值，此前取到的是默认值拷贝，-config 自定义路径时横幅
+	// 会报一份根本没读的文件。下面退回「默认+env」时清空，同理（issue #155）。
+	loadedFrom := *cfgPath
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -431,6 +460,7 @@ func main() {
 	if cfg.Admin.AuditEnabled {
 		al, aerr := server.NewAuditLog(cfg.Admin.AuditFile, cfg.APIKey)
 		if aerr != nil {
+			p.Flush() // Fatal 绕过 defer：至少把池状态落盘再退，否则丢整轮运行状态
 			log.Fatalf("admin audit: %v", aerr)
 		}
 		auditLog = al
@@ -479,6 +509,7 @@ func main() {
 	go updateManager.Run(ctx)
 	// 账号后台任务（taskjobs）：状态与主 state 同目录，重启后自动恢复未完成作业。
 	if err := pn.StartTaskJobs(ctx, stateSibling(cfg.StateFile, "task-jobs.json")); err != nil {
+		p.Flush() // Fatal 绕过 defer：至少把池状态落盘再退
 		log.Fatalf("task jobs: %v", err)
 	}
 	defer pn.StopTaskJobs()
@@ -538,13 +569,25 @@ func main() {
 		defer close(shutdownDone)
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 在途请求排干窗口可配（server.shutdown_timeout，缺省 30s）：长流式 SSE
+		// 合法时长可达分钟级，固定 5s 必然把在途请求掐成连接重置；超时不再静默。
+		shutdownTimeout := cfg.ShutdownTimeoutDur
+		if shutdownTimeout <= 0 {
+			shutdownTimeout = 5 * time.Second
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("WARN: 优雅关停未在 %s 内完成，在途请求被放弃: %v", shutdownTimeout, err)
+		}
 	}()
 
+	if warn := insecureKeyWarning(cfg.Listen, cfg.APIKey); warn != "" {
+		log.Printf("WARN: %s", warn)
+	}
 	log.Print(listenBanner(cfg.Listen, loadedFrom, cfg.APIKey))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		p.Flush() // 监听失败时信号路径不会跑：这里同样兜底落盘再退
 		log.Fatalf("http: %v", err)
 	}
 	if ctx.Err() != nil {
@@ -847,6 +890,7 @@ func restartRequiredFields(current, next *Config) []string {
 	changed("logging.request_retention_days", current.Logging.RequestRetentionDays, next.Logging.RequestRetentionDays)
 	changed("logging.request_archive_max_mb", current.Logging.RequestArchiveMaxMB, next.Logging.RequestArchiveMaxMB)
 	changed("server.read_timeout", current.Server.ReadTimeout, next.Server.ReadTimeout)
+	changed("server.shutdown_timeout", current.Server.ShutdownTimeout, next.Server.ShutdownTimeout)
 	return out
 }
 
