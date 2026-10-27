@@ -478,8 +478,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
     gap: 10px; padding: 14px 17px 2px; }
   .kpis.k4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  @media (max-width: 1180px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-  @media (max-width: 700px) { .kpis, .kpis.k4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  /* k7：用量总览七张卡（含平均缓存命中率）。宽屏一行放下；中屏折 4 列（4+3），
+     窄屏与基础栅格一样 2 列。 */
+  .kpis.k7 { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+  @media (max-width: 1180px) {
+    .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .kpis.k7 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  }
+  @media (max-width: 700px) { .kpis, .kpis.k4, .kpis.k7 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .kpi {
     position: relative; min-width: 0; overflow: hidden;
     background: var(--surface-2); border: 1px solid var(--line-soft);
@@ -1082,7 +1088,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="trange" id="usRange"></span>
           <button class="xs" id="btnUsage">刷新</button>
         </header>
-        <div class="kpis" id="usStats"></div>
+        <div class="kpis k7" id="usStats"></div>
         <div class="pad">
           <div class="uschart">
             <div class="uschart-hd">
@@ -1284,6 +1290,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="account_spread_min_gap_seconds" type="number" min="0" max="3600" placeholder="0">
                 <span class="hint">0 = 只做随机。两个账号撞在同一时段时把后者推开；账号数 × 该值接近窗口时末尾会挤在一起。</span></label>
             </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">刷新抖动（‰）</span>
+                <input name="balance_refresh_jitter_permill" type="number" min="0" max="500" placeholder="0">
+                <span class="hint">0 = 关闭。余额刷新间隔按 ±该比例随机偏移：5 分钟 + 200 即实际 3–7 分钟。</span></label>
+              <label class="fld"><span class="lb">清扫抖动（‰）</span>
+                <input name="task_sweep_jitter_permill" type="number" min="0" max="500" placeholder="0">
+                <span class="hint">同上，作用于补领清扫间隔。上限 500（50%）。</span></label>
+              <label class="fld"><span class="lb">夜猫子参与上限</span>
+                <input name="night_account_cap" type="number" min="0" placeholder="0">
+                <span class="hint">0 = 全池参与。&gt;0 时只在积分最高的前 N 个账号做夜间真实对话。</span></label>
+            </div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
               <input type="checkbox" name="include_disabled_in_tasks"></div>
@@ -1379,6 +1396,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">模型黑名单</span>
                 <input name="models_hidden" placeholder="deepseek-pro, cn:legacy-model">
                 <span class="hint">逗号分隔；裸名隐藏两域，cn: / global: 只隐藏该域；/v1/models 不列且点名调用直接拒绝，保存即热生效</span></label>
+              <label class="fld"><span class="lb">模型白名单</span>
+                <input name="models_allowed" placeholder="glm-5.2, global:gpt-5.4">
+                <span class="hint">逗号/空白分隔；空 = 不启用（默认全部放行）；非空时仅白名单内模型可列出与被调用，裸名两域、cn: / global: 只在该域；清空即关闭白名单，保存即热生效</span></label>
               <label class="fld"><span class="lb">模型映射</span>
                 <input name="models_aliases" placeholder="claude-opus-4=glm-5.2, gpt-5=global:gpt-5.4">
                 <span class="hint">逗号分隔的「客户端名=真实模型名」；真实名可带 cn:/global: 前缀跨域指向；响应回显客户端原发名；目标仍受黑名单约束，保存即热生效</span></label>
