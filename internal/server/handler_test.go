@@ -243,13 +243,18 @@ func TestChatBadParamsFailsFastWithoutPenalty(t *testing.T) {
 	}
 }
 
-// TestChatQueueFullFailsFastWithoutPenalty 上游 429 + code 6021「queue.full.title」
-// 是渠道级准入队列满（上游容量信号），不是账号问题。2026-10-15 实案：按 ErrSoftRate
-// 处置会逐号软冷却，与全冷却兜底互相喂（兜底把冷却号再送上游，再撞 6021 又续订），
-// 几秒的排队放大成整段时间全量 429（本仓当日 18 次全落 soft_rate）。端到端断言：
-// 不轮转（只打一次上游）、直接回 503 + upstream_busy + 上游原文在场、
-// Retry-After 本地兜底 5s、账号零惩罚。
-func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
+// TestChatQueueBusyRotatesThen429WithoutPenalty 上游 429 + code 6020/6021
+// 「渠道级排队/容量满载」是上游容量信号，不是账号问题。2026-10-15 实案的教训
+// 保留：罚号（ErrSoftRate 处置）会逐号软冷却、与全冷却兜底互相喂，几秒的排队
+// 放大成整段时间全量 429——所以**零惩罚**不变。2026-10-28 生产实案修正两点：
+//   - 恢复请求内轮转：排队可用性间歇（同一分钟内既有 6021 也有成功），一次性
+//     fail-fast 把抖动直接交给客户端；
+//   - 末端回 429 + Retry-After 而非 503：上游本身回 429，WorkBuddy CLI 对 429
+//     按 Retry-After 自动重试、对 503 直接中断任务。
+//
+// 端到端断言：轮转打满两个号（各一次）、429 + Retry-After 本地兜底 5s、
+// 上游原文在场、账号零惩罚。
+func TestChatQueueBusyRotatesThen429WithoutPenalty(t *testing.T) {
 	const upstreamBody = `{"code":6021,"msg":"queue.full.title","requestId":"b1bc87ea3a771e835e388328713d47cf"}`
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -265,22 +270,43 @@ func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
-	if rec.Code != 503 {
-		t.Fatalf("code=%d body=%s (want 503 fail-fast，非 429)", rec.Code, rec.Body)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s (want 429，轮转耗尽后的可重试语义，非 503)", rec.Code, rec.Body)
 	}
 	if !strings.Contains(rec.Body.String(), "6021") || !strings.Contains(rec.Body.String(), "b1bc87ea") {
-		t.Errorf("503 body 应透传上游原文（含 code+requestId）: %s", rec.Body)
+		t.Errorf("429 body 应透传上游原文（含 code+requestId）: %s", rec.Body)
 	}
 	if ra := rec.Header().Get("Retry-After"); ra != "5" {
 		t.Errorf("Retry-After=%q want 5（上游未给重置口径时的本地兜底）", ra)
 	}
-	if calls["Bearer at-busy1"] != 1 || calls["Bearer at-busy2"] != 0 {
-		t.Errorf("calls=%v want 只打一次上游、busy2 号 0 次（不轮转）", calls)
+	if calls["Bearer at-busy1"] != 1 || calls["Bearer at-busy2"] != 1 {
+		t.Errorf("calls=%v want 两号各一次（轮转、tried 不重复选号）", calls)
 	}
 	// 账号完好：无冷却、无禁用、无熔断计数、无 errTotal（ErrSoftRate 会冷却+喂 streak）。
 	st, _ := p.Status("busy1")
 	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 || st.SoftStreak != 0 {
 		t.Errorf("ErrUpstreamBusy must not penalize account: %+v", st)
+	}
+}
+
+// TestChatQueueWaitingRetryAfterFromBody 6020「queue.waiting」的重试口径在 body
+// （data.retry_after=40，实测真机形态：头侧无 Retry-After），末端 429 的 Retry-After
+// 必须取到 40 而不是本地兜底 5——WorkBuddy CLI 把该头当「睡多久」的指令执行，
+// 差 35s 直接决定客户端的排队节奏是否与上游一致。
+func TestChatQueueWaitingRetryAfterFromBody(t *testing.T) {
+	const upstreamBody = `{"code":6020,"msg":"queue.waiting.title","requestId":"01a181ca3b67934d01c3f64599c8490c","data":{"queue_position":2502,"queue_size":"999+","retry_after":40,"estimated_wait":12510}}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 429, upstreamBody, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "q1", AccessToken: "at-q1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d want 429 (body=%s)", rec.Code, rec.Body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "40" {
+		t.Errorf("Retry-After=%q want 40（data.retry_after 透传，非本地兜底）", ra)
 	}
 }
 
@@ -431,6 +457,15 @@ func TestChatSyncEmptyUpstreamBodyIs502(t *testing.T) {
 
 func TestChatStreamPassthrough(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		// 首帧必须落在**首 token 计时开始之后**：tokensPerSecond 用
+		// (端到端 - TTFB) 作分母，而 TTFB<=0 被定义为「没有观测」→ 不报速率
+		// （handler.go tokensPerSecond 的 ttfb<=0 分支）。
+		//
+		// fake 的 body 是内存 strings.Reader，读首帧几乎零耗时；Windows 的
+		// time.Now() 粒度约 0.5~1ms，两次调用落进同一 tick 时 TTFB 恰好为 0，
+		// 于是 -count=N 或 CI 上偶发 LastTokensPerSecond=nil（本机 30 次复现 11 次、
+		// 与本次改动无关的既有 flake）。显式睡过时钟粒度，让 TTFB 恒 >0。
+		time.Sleep(2 * time.Millisecond)
 		return 200, sseOK, true
 	})
 	h := NewHandler(Config{
@@ -1387,7 +1422,11 @@ func TestModelsDynamic(t *testing.T) {
 	// 断言字段映射：maxInputTokens → context_length，maxOutputTokens → max_output_tokens
 	for _, m := range data {
 		mm := m.(map[string]any)
-		switch mm["id"] {
+		// 条目的 id 带 "cn:" 前缀（网关路由协议），比较前去掉，否则下面所有
+		// 分支都不会命中——曾经就是这样「测了但没断言」。
+		id, _ := mm["id"].(string)
+		id = strings.TrimPrefix(id, "cn:")
+		switch id {
 		case "dyn-model-a":
 			if mm["context_length"].(float64) != 65536 {
 				t.Errorf("dyn-model-a context_length=%v want 65536", mm["context_length"])
@@ -1395,21 +1434,25 @@ func TestModelsDynamic(t *testing.T) {
 			if mm["max_output_tokens"].(float64) != 8192 {
 				t.Errorf("dyn-model-a max_output_tokens=%v want 8192", mm["max_output_tokens"])
 			}
-			// reasoning 档位透出：supported_efforts + default_effort
-			efforts, _ := mm["supported_efforts"].([]any)
+			// reasoning 档位透出：reasoning_supported_efforts + reasoning_default_effort
+			efforts, _ := mm["reasoning_supported_efforts"].([]any)
 			if len(efforts) != 3 || efforts[0] != "low" {
-				t.Errorf("dyn-model-a supported_efforts=%v", mm["supported_efforts"])
+				t.Errorf("dyn-model-a reasoning_supported_efforts=%v", mm["reasoning_supported_efforts"])
 			}
-			if mm["default_effort"] != "medium" {
-				t.Errorf("dyn-model-a default_effort=%v want medium", mm["default_effort"])
+			if mm["reasoning_default_effort"] != "medium" {
+				t.Errorf("dyn-model-a reasoning_default_effort=%v want medium", mm["reasoning_default_effort"])
+			}
+			// 不声明网关专有字段，也不在策略未启用时改写上游默认档。
+			if _, has := mm["reasoning_gateway_effort"]; has {
+				t.Errorf("不得透出网关专有字段 reasoning_gateway_effort")
 			}
 		case "dyn-model-b":
 			// 上游未返回 reasoning → 两个档位字段都省略（客户端按自身默认）
-			if _, has := mm["supported_efforts"]; has {
-				t.Errorf("dyn-model-b supported_efforts should be omitted, got %v", mm["supported_efforts"])
+			if _, has := mm["reasoning_supported_efforts"]; has {
+				t.Errorf("dyn-model-b reasoning_supported_efforts should be omitted, got %v", mm["reasoning_supported_efforts"])
 			}
-			if _, has := mm["default_effort"]; has {
-				t.Errorf("dyn-model-b default_effort should be omitted")
+			if _, has := mm["reasoning_default_effort"]; has {
+				t.Errorf("dyn-model-b reasoning_default_effort should be omitted")
 			}
 		case "glm-9.9":
 			if mm["context_length"].(float64) != 262144 {
@@ -1427,6 +1470,28 @@ func TestModelsDynamic(t *testing.T) {
 	dynamicModelsCache.RUnlock()
 	if cached != 3 {
 		t.Errorf("cache not populated: %d", cached)
+	}
+
+	// 配置网关策略后：默认档声明改成网关实际会补的档（max → 最高支持档），
+	// 客户端照这个值预填不会把网关补档抵消掉。
+	up.SetEffortPolicy(&upstream.EffortPolicy{Enabled: true, DefaultEffort: "max"})
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.Unlock()
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	for _, m := range resp["data"].([]any) {
+		mm := m.(map[string]any)
+		if mm["id"] != "cn:dyn-model-a" {
+			continue
+		}
+		if got := mm["reasoning_default_effort"]; got != "high" {
+			t.Errorf("reasoning_default_effort=%v want high（max → 最高支持档）", got)
+		}
+		if _, has := mm["reasoning_gateway_effort"]; has {
+			t.Errorf("不得透出网关专有字段 reasoning_gateway_effort")
+		}
 	}
 }
 
@@ -1828,8 +1893,66 @@ func TestStatusRequiresAuth(t *testing.T) {
 	}
 }
 
-// TestContentBlockedTriggersDegradedRetry passthrough 模式下首请求 400（11128 文案）
-// → 降级重试（Degraded）→ 200，客户端无感。验证第二次出站 body 为 Degraded。
+// TestContentBlockedSplitSystemFirst 11-128 的首选抢救是「拆句留在 system」：
+// 多句 system 被拆成多条 system 消息重试，**不搬到 user**（承载通道不变）。
+// 单句 system 拆不动时才走搬家（见 TestContentBlockedTriggersDegradedRetry）。
+func TestContentBlockedSplitSystemFirst(t *testing.T) {
+	var bodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, raw)
+			if len(bodies) == 1 {
+				return &http.Response{
+					StatusCode: 400,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"code":11-128,"msg":"blocked by security policy"}`)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	const sys = "Fingerprint sentence one here. Fingerprint sentence two here."
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"`+sys+`"},{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls, got %d", len(bodies))
+	}
+	var second map[string]any
+	if err := json.Unmarshal(bodies[1], &second); err != nil {
+		t.Fatalf("second body json: %v", err)
+	}
+	msgs := second["messages"].([]any)
+	// 拆成两条 system + 原 user；全文仍在 system 里，user 未被塞入 system 原文。
+	if len(msgs) != 3 {
+		t.Fatalf("want 3 条消息（2 system + 1 user），got %d: %v", len(msgs), msgs)
+	}
+	for i := 0; i < 2; i++ {
+		if role := msgs[i].(map[string]any)["role"]; role != "system" {
+			t.Errorf("第 %d 条应为 system: %v", i, role)
+		}
+	}
+	if got := msgs[2].(map[string]any)["content"]; got != "hi" {
+		t.Errorf("user 被动了: %v", got)
+	}
+}
+
+// TestContentBlockedTriggersDegradedRetry 单句 system 拆不动 → 走搬家：
+// passthrough 模式下首请求 400（11-128 文案）→ 重试 → 200，客户端无感。
+// 断言第二次出站的 system 是 Degraded 中性句、system 原文进了首条 user。
 func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	// 记录每次出站请求体，断言第二次为 Degraded 文本。
 	var bodies [][]byte
@@ -1866,12 +1989,20 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	if len(bodies) != 2 {
 		t.Fatalf("want 2 upstream calls (first 400 + retry), got %d", len(bodies))
 	}
-	// 第二次出站 body 的 messages 头部 system 内容应为 Degraded 文本。
+	// 第二次出站：system 换成 Degraded 中性句，**原文搬进首条 user**（不再丢弃人格）。
 	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
 		t.Errorf("second body should contain Degraded prompt: %s", bodies[1])
 	}
-	if strings.Contains(string(bodies[1]), "原始指纹") {
-		t.Errorf("second body should not contain original system: %s", bodies[1])
+	var second map[string]any
+	if err := json.Unmarshal(bodies[1], &second); err != nil {
+		t.Fatalf("second body json: %v", err)
+	}
+	msgs := second["messages"].([]any)
+	if got := msgs[0].(map[string]any)["content"]; got != prompt.Degraded {
+		t.Errorf("首条 system 应为 Degraded: %v", got)
+	}
+	if got, _ := msgs[1].(map[string]any)["content"].(string); !strings.Contains(got, "原始指纹") {
+		t.Errorf("system 原文应搬进首条 user 而不是丢掉: %v", msgs[1])
 	}
 }
 

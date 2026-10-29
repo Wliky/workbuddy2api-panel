@@ -111,6 +111,12 @@ type Panel struct {
 	taskMu    sync.Mutex
 	taskLocks map[string]*sync.Mutex
 
+	// softRateMu/softRateUntil 上游软限流（429）的账号级冷却截止：撞过一次就记下来，
+	// 同一轮里后续任务动作直接快失败，不每个动作都再睡一遍——一轮全量任务有几十个
+	// 动作，逐个睡会让后台作业卡住几十分钟，还占着 taskLocks 把手动触发一起堵死。
+	softRateMu    sync.Mutex
+	softRateUntil map[string]time.Time
+
 	// batchRunning 手动全量运维接口（签到/旅行/活跃/保活/余额）共用的防重入闸门：
 	// 这些动作都是逐号打上游，并发跑两轮 = 每号至少翻倍上游请求，正是批间节流
 	// 要避免的场景。TryLock 语义，见 tryStartBatch。
@@ -274,6 +280,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("POST /panel/api/model_hidden", p.withAuth(p.setModelHidden))
+	p.mux.HandleFunc("POST /panel/api/model_effort", p.withAuth(p.setModelEffort))
 	p.mux.HandleFunc("GET /panel/api/update", p.withAuth(p.updateStatus))
 	p.mux.HandleFunc("POST /panel/api/update/check", p.withAuth(p.checkUpdate))
 	p.mux.HandleFunc("POST /panel/api/update/install", p.withAuth(p.installUpdate))
@@ -584,7 +592,14 @@ func (p *Panel) nicknames() map[string]string {
 // （有错误明细回 502，一个账号都没有回 503）。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
-	var fetchErrs []string
+	// catalogErrs = 目录探测失败（决定「整份视图是否可信」→ 报 502 / 不写缓存）；
+	// busyErrs = 繁忙度观测失败（**只是少一列**，目录本身已经拿到）。
+	//
+	// 两者必须分开：此前只有 fetchErrs 一个切片，国际版 /v2/chat/busy 恒 404（见
+	// upstream/modelbusy.go）就永久占着一条错误，于是 `len(fetchErrs)==0` 的写缓存条件
+	// 永远不成立——只要池里有 global 账号，模型目录缓存完全失效，面板每次刷新都实打上游。
+	var catalogErrs []string
+	var busyErrs []string
 
 	// refresh=1：强制重探 global 目录（issue #216 现象 3）。此前按钮只是重读 1h 缓存，
 	// 上游目录变了也纹丝不动。CN 侧本来就是每请求直连上游（无缓存），无需处理。
@@ -594,7 +609,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	} else if entry := p.loadModelsCache(); entry != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":            true,
-			"models":        entry.models,
+			"models":        p.withLiveFlags(entry.models),
 			"global_source": entry.globalSource,
 			"cached":        true,
 		})
@@ -609,7 +624,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			cnAcct = acct
 			infos, err := p.cfg.Upstream.FetchModels(acct)
 			if err != nil {
-				fetchErrs = append(fetchErrs, "cn: "+err.Error())
+				catalogErrs = append(catalogErrs, "cn: "+err.Error())
 			} else {
 				for _, mi := range infos {
 					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
@@ -626,7 +641,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 				globalAcct = acct
 				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
 				if len(infos) == 0 {
-					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
+					catalogErrs = append(catalogErrs, "global: 上游未返回可用模型")
 				} else {
 					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
 					for _, mi := range infos {
@@ -707,8 +722,8 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 模型繁忙度（官方 /v2/chat/busy，只读观测，见 upstream/modelbusy.go）：与目录同一批
-	// 账号查，附到对应域的行上。查不到就不填字段（不编造）；失败只并入 fetchErrs（目录本身
-	// 已经拿到了，不该因为繁忙度查询失败把整个视图打成 502）。
+	// 账号查，附到对应域的行上。查不到就不填字段（不编造）；失败只并入 busyErrs（目录本身
+	// 已经拿到了，不该因为繁忙度查询失败把整个视图打成 502，更不该阻断目录缓存）。
 	for realm, acct := range map[string]*auth.Auth{"cn": cnAcct, "global": globalAcct} {
 		if acct == nil {
 			continue
@@ -725,7 +740,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 		levels, err := p.cfg.Upstream.ModelBusy(acct, ids)
 		if err != nil {
-			fetchErrs = append(fetchErrs, realm+" busy: "+err.Error())
+			busyErrs = append(busyErrs, realm+" busy: "+err.Error())
 			continue
 		}
 		for _, e := range out {
@@ -738,24 +753,28 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(out) == 0 {
-		if len(fetchErrs) > 0 {
-			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
+		if errs := append(append([]string{}, catalogErrs...), busyErrs...); len(errs) > 0 {
+			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(errs, "; "))
 			return
 		}
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
 	globalSource := p.cfg.Upstream.GlobalCatalogSource()
-	if len(fetchErrs) == 0 {
+	// 只有目录错误才拒绝写缓存；繁忙度失败不阻断（否则国际版恒 404 会让缓存永久失效）。
+	if len(catalogErrs) == 0 {
 		p.storeModelsCache(&modelsCacheEntry{models: out, globalSource: globalSource})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
-		"models": out,
+		"models": p.withLiveFlags(out),
 		// global_source global 目录来源（v3-desktop / v3-union / enterprise）。
 		// 前端据此提示「拿到的是回落/降级目录」——issue #216 里用户只看到「少了 11 个模型」，
 		// 完全不知道已经降级到企业端点（那份目录只有 18 条、hy4-preview 的倍率还是旧值）。
 		"global_source": globalSource,
+		// busy_errs 繁忙度观测失败明细（目录不受影响）：国际版没有 /v2/chat/busy，
+		// 首轮会在这里出现一条，之后按域短路不再产生。
+		"busy_errs": busyErrs,
 	})
 }
 
@@ -775,6 +794,54 @@ func (p *Panel) storeModelsCache(entry *modelsCacheEntry) {
 	defer p.modelsMu.Unlock()
 	p.modelsCache = entry
 	p.modelsCacheAt = time.Now()
+}
+
+// withLiveFlags 给模型条目补运行期标记（每次响应按 live 快照现算，不写进 60s
+// 缓存：面板里切换「下游可见」或改思考档位策略后，同一缓存周期内也要立刻看到变化）。
+//
+//   - hidden：是否对下游暴露（models.hidden）；
+//   - gateway_policy_enabled：思考档位策略是否开启（关闭时行内「网关档位」下拉置灰）；
+//   - gateway_effort：按当前策略算出的**实际会注入的档位**——先按
+//     model_defaults → 全局 default_effort 求目标档，再由模型真实支持的档位解析
+//     （与出站 applyEffortPolicy 同一套 ResolveGatewayEffort，列表与注入不再漂移）。
+//
+// 返回浅拷贝切片，缓存条目本身不被改写——并发请求共享同一份缓存。
+func (p *Panel) withLiveFlags(entries []map[string]any) []map[string]any {
+	var hidden map[string]struct{}
+	policy := upstream.EffortPolicy{}
+	if p.cfg.Live != nil {
+		s := p.cfg.Live.Load()
+		hidden = s.HiddenModels
+		policy = upstream.EffortPolicy{
+			Enabled:        s.ThinkingEnabled,
+			DefaultEffort:  s.ThinkingDefaultEffort,
+			ClientPriority: s.ThinkingClientPriority,
+			OverrideScope:  s.ThinkingOverrideScope,
+			ModelDefaults:  s.ThinkingModelDefaults,
+		}.Normalized()
+	}
+	out := make([]map[string]any, len(entries))
+	for i, e := range entries {
+		cp := make(map[string]any, len(e)+3)
+		for k, v := range e {
+			cp[k] = v
+		}
+		if id, ok := e["id"].(string); ok {
+			_, hide := hidden[id]
+			cp["hidden"] = hide
+			cp["gateway_policy_enabled"] = policy.Enabled
+			realm, bare, hasRealm := strings.Cut(id, ":")
+			if !hasRealm {
+				realm, bare = "", id
+			}
+			supported, _ := e["supported_efforts"].([]string)
+			if eff := upstream.ResolveGatewayEffort(policy.DefaultEffortFor(realm, bare), supported); eff != "" {
+				cp["gateway_effort"] = eff
+			}
+		}
+		out[i] = cp
+	}
+	return out
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
