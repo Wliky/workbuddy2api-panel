@@ -268,14 +268,16 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* .radios label 里的单选框必须收成控件自身宽度：面板全局给 form input 设了
    100% 宽 + block，直接套到 radio 上会把整行文字挤成竖排（label 高 200~400px）。 */
 .radios input { margin-top: 3px; flex: none; width: auto; display: inline-block; }
-.who { min-width: 118px; max-width: 200px; }
+.who { min-width: 130px; max-width: 240px; }
 #taskTable .who { max-width: 360px; }
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
-.who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who .nm { display: flex; align-items: center; gap: 5px; min-width: 0; font-weight: 550; }
+.who .nm .nm-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who .nm .realm-tag { flex: none; margin-left: 0; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .acc.md .who .nm { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .acc.md .who .nm .mid { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
+.realm-tag { display: inline-block; padding: 1px 5px; border-radius: 4px; font: 500 10px/1.1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); white-space: nowrap; vertical-align: middle; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
@@ -330,11 +332,11 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
    导致 vertical-align:middle 失效（按钮整体偏上、行线不齐）。这里强制恢复
    table-cell，让该列和其他列一样参与行高与垂直居中；按钮排列交给内层 .acts-inner。 */
 td.acts { display: table-cell; vertical-align: middle; text-align: right; }
-/* 账号池操作列：每个动作占固定槽位（签到 / 余额 / 任务 / 选号 / 禁用 / 移除），
+/* 账号池操作列：每个动作占固定槽位（签到 / 余额 / 任务 / 探活 / 选号 / 禁用 / 备注 / 移除），
    缺哪个留空槽。否则「解冻 / 暂停选号 / 恢复选号」互斥会改变按钮个数，整列左右错位。
    分列放在内层 div：td 保持 table-cell，vertical-align:middle 才继续生效
    （直接给 td 设 display:grid 会退出表格布局，按钮变顶对齐）。 */
-.acts-inner { display: grid; grid-template-columns: repeat(4, 54px) 68px repeat(2, 54px); gap: 5px; justify-content: end; align-items: center; }
+.acts-inner { display: grid; grid-template-columns: repeat(4, 54px) 68px repeat(3, 54px); gap: 5px; justify-content: end; align-items: center; }
 /* 统一盒模型：primary 与 ghost 的边框/行高不同会让「解冻」行比「暂停选号」行高 2~3px，
    行线因此参差。固定高度 + border-box 后每行等高、按钮底边对齐。 */
 .acts-inner button { width: 100%; height: 26px; box-sizing: border-box; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
@@ -859,6 +861,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="box">
         <header>
           <h3>账号池</h3>
+          <span class="vtabs" id="accRealmTabs">
+            <button type="button" data-realm="all" class="on">全部<span class="cnt" id="accCntAll">0</span></button>
+            <button type="button" data-realm="cn">国内版<span class="cnt" id="accCntCn">0</span></button>
+            <button type="button" data-realm="global">国际版<span class="cnt" id="accCntGlobal">0</span></button>
+          </span>
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
           <button class="xs" id="btnRemarks">备注</button>
@@ -1252,13 +1259,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                   <input name="growth_concurrency" type="number" min="1" max="4" placeholder="1">
                   <span class="hint">1-4；调高更快，上游风控暴露面更大</span></label>
               </div>
-              <div>
-                <div class="switch"><span class="lb">夜猫子</span>
-                  <input type="checkbox" name="blackcat_enabled"></div>
-                <label class="fld"><span class="lb">补足时点（小时，逗号分隔）</span>
-                  <input name="blackcat_hours" placeholder="23">
-                  <span class="hint">只在 23:00–08:00 计数窗口内生效，窗口外自动跳过</span></label>
-              </div>
             </div>
             <div class="hr"></div>
             <div class="grid2">
@@ -1278,7 +1278,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="grid2">
               <label class="fld"><span class="lb">账号摊开窗口（分钟）</span>
                 <input name="account_spread_minutes" type="number" min="0" max="1440" placeholder="0">
-                <span class="hint">0 = 关闭（同一秒打全池）。&gt;0 时签到 / 旅行 / 活跃上报 / 保活 / 夜猫子把账号错开在窗口内各自的时刻。手动触发不受影响。窗口应小于相邻时点间隔。</span></label>
+                <span class="hint">0 = 关闭（同一秒打全池）。&gt;0 时签到 / 旅行 / 活跃上报 / 保活把账号错开在窗口内各自的时刻。手动触发不受影响。窗口应小于相邻时点间隔。</span></label>
               <label class="fld"><span class="lb">账号最小间隔（秒）</span>
                 <input name="account_spread_min_gap_seconds" type="number" min="0" max="3600" placeholder="0">
                 <span class="hint">0 = 只做随机。两个账号撞在同一时段时把后者推开；账号数 × 该值接近窗口时末尾会挤在一起。</span></label>
@@ -1290,9 +1290,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">清扫抖动（‰）</span>
                 <input name="task_sweep_jitter_permill" type="number" min="0" max="500" placeholder="0">
                 <span class="hint">同上，作用于补领清扫间隔。上限 500（50%）。</span></label>
-              <label class="fld"><span class="lb">夜猫子参与上限</span>
-                <input name="night_account_cap" type="number" min="0" placeholder="0">
-                <span class="hint">0 = 全池参与。&gt;0 时只在积分最高的前 N 个账号做夜间真实对话。</span></label>
               <label class="fld"><span class="lb">每轮补签卡上限</span>
                 <input name="makeup_cards_per_round" type="number" min="0" placeholder="0">
                 <span class="hint">0 = 不限（补到卡用光）。&gt;0 时每轮连登管家最多用这么多张，剩下的漏签下一轮继续——补签会改账号历史，保守部署可设 1。</span></label>
