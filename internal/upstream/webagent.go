@@ -24,8 +24,9 @@
 //     用账号 token 一律 401 `12801:鉴权失败`——SSE 那一步照样 200 并给出
 //     Acp-Connection-Id，只有真正的 JSON-RPC 请求才暴露鉴权错，很容易被误判成
 //     「链路搭好了只是没输出」。
-//  2. ACP 用**浏览器**身份（Chromium UA + Origin/Referer /app），不是桌面端
-//     WorkBuddy UA 指纹；建会话/取 session 这两个 console 接口同样是 web 身份。
+//  2. ACP 的 JSON-RPC 走沙箱 link（带会话 token），UA 沿用 web 形态；但**建会话 /
+//     取 session / 轮询状态这三个 console 接口不是浏览器身份**——2026-10-30 国内
+//     5.9.3 真机实测它们是桌面端 RPC 三段式 UA + 无 Origin/Referer（见 webReq）。
 //  3. 上游对每个账号同时存在的活跃会话有硬上限（10 条，超了 429/code 10105）。
 //     每条会话跑完必须 stop/delete，否则每天漏一条，攒满就再也建不出会话。
 package upstream
@@ -42,6 +43,7 @@ import (
 	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
 
 const (
@@ -89,11 +91,17 @@ type WebTurnResult struct {
 	SetModelFailed bool
 }
 
-// webReq 构造 console/as 网页通道请求：浏览器身份 + Bearer + X-User-Id。
+// webReq 构造 console/as 网页通道请求：桌面端 RPC 身份 + Bearer + X-User-Id。
 //
-// 不复用 CommonHeaders：那一套是**桌面端 RPC 层**形态（WorkBuddy UA、X-Requested-With、
-// 无 Origin）。网页通道在上游是另一个前端，UA / Origin / Referer 都不同，混用会把
-// 两个前端指纹糊成一个（两边都不像）。
+// 2026-10-30 国内 5.9.3 真机复核（/console/as/conversations/、/console/as/projects/*、
+// /console/as/conversation-sync/*、/console/as/support/scenes）：这条「网页通道」在
+// 5.9.3 上**根本不是浏览器身份**——UA 是桌面端 RPC 三段式，**没有 Origin / Referer**
+// （全部 242 条 console/as 请求无一携带），另带 X-Product / X-Request-ID / X-Domain。
+//
+// 旧实现按「网页前端」发了浏览器 UA + Origin + Referer，等于把两个前端指纹糊成一个
+// （两边都不像）。注意本文件后段 SSE / ACP JSON-RPC 两条走的是沙箱 link
+// （另一个服务，带会话 token），仍沿用 globalWebUA——本轮抓包未覆盖该 link，
+// 不做无证据改动。
 func (c *Client) webReq(ctx context.Context, a *auth.Auth, method, url string, body any) (*http.Request, error) {
 	var rdr io.Reader
 	if body != nil {
@@ -107,11 +115,11 @@ func (c *Client) webReq(ctx context.Context, a *auth.Auth, method, url string, b
 	if err != nil {
 		return nil, err
 	}
-	base := c.chatBase(a)
-	req.Header.Set("User-Agent", globalWebUA)
+	req.Header.Set("User-Agent", c.rpcUAFor(a))
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Origin", base)
-	req.Header.Set("Referer", base+"/app")
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("X-Request-ID", session.NewTraceID())
+	req.Header.Set("X-Domain", c.chatHost(a))
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
@@ -135,7 +143,7 @@ func (c *Client) webJSON(ctx context.Context, a *auth.Auth, method, url string, 
 	if err != nil {
 		return err
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return err
 	}
@@ -289,7 +297,7 @@ func (c *Client) RunWebAgentTurn(ctx context.Context, a *auth.Auth, id string, s
 	streamReq.Header.Set("Accept", "text/event-stream")
 	streamReq.Header.Set("Authorization", "Bearer "+sess.Token)
 	streamReq.Header.Set("User-Agent", globalWebUA)
-	stream, err := c.chatHTTP().Do(streamReq)
+	stream, err := c.do(streamReq, a, true)
 	if err != nil {
 		return res, fmt.Errorf("acp sse: %w", err)
 	}
@@ -342,7 +350,7 @@ func (c *Client) RunWebAgentTurn(ctx context.Context, a *auth.Auth, id string, s
 	}()
 
 	rpc := func(rid int, method string, params any) error {
-		return c.acpPost(ctx, sess, connID, rid, method, params)
+		return c.acpPost(ctx, a, sess, connID, rid, method, params)
 	}
 	if err := rpc(1, "initialize", map[string]any{
 		"protocolVersion": acpProtocolVersion,
@@ -404,7 +412,7 @@ func (c *Client) RunWebAgentTurn(ctx context.Context, a *auth.Auth, id string, s
 // 注意 Authorization 用的是**沙箱 token**（sess.Token），不是账号 access token：
 // 用账号 token 会 401 `12801:鉴权失败`，而 SSE 通道照样 200——这是本实现第一次
 // 落地时踩的坑（见文件头第 1 条）。
-func (c *Client) acpPost(ctx context.Context, sess WebSession, connID string, rid int, method string, params any) error {
+func (c *Client) acpPost(ctx context.Context, a *auth.Auth, sess WebSession, connID string, rid int, method string, params any) error {
 	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
 	if err != nil {
 		return err
@@ -418,7 +426,7 @@ func (c *Client) acpPost(ctx context.Context, sess WebSession, connID string, ri
 	req.Header.Set("Acp-Connection-Id", connID)
 	req.Header.Set("Authorization", "Bearer "+sess.Token)
 	req.Header.Set("User-Agent", globalWebUA)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return err
 	}

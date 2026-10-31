@@ -48,7 +48,7 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 		return nil, err
 	}
 	c.BillingHeaders(req, a)
-	return c.doJSON(req)
+	return c.doJSON(req, a)
 }
 
 // billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
@@ -297,14 +297,16 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 	if err != nil {
 		return err
 	}
-	// 头族逐字对齐 5.9.3 真机 /v2/report：
+	// 头族逐字对齐真机 /v2/report（2026-10-30 双版本，国际 37 条 + 国内多条）：
 	//   Accept: application/json, text/plain, */*
 	//   Content-Type: application/json;charset=UTF-8
-	//   X-Requested-With: XMLHttpRequest
 	//   X-Request-ID / X-Product: SaaS / User-Agent 三段式 / Authorization / X-User-Id / X-Domain
+	//
+	// **不发 X-Requested-With**：真机 /v2/report 按 UA 分两族，只有渲染器侧那族
+	// （UA 首段驼峰 `WorkBuddy/<ver> <brand>/<ver> …`）带它；本函数发的三段式
+	// （`<brand>/<ver> <brand>/<ver> …`）一族**没有**。两族头各取一半就是第三族。
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("X-Request-ID", session.NewMessageID())
 	req.Header.Set("X-Product", "SaaS")
 	req.Header.Set("User-Agent", desktopUAFor(a))
@@ -316,6 +318,6 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 	}
 	req.Header.Set("X-Domain", c.chatHost(a))
 	// 设备风控头：真机 /v2/report 不带 X-Device-Token（只有 billing 族带），故不注入。
-	_, err = c.doJSON(req)
+	_, err = c.doJSON(req, a)
 	return err
 }

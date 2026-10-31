@@ -25,6 +25,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/loginsite"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
 
@@ -792,7 +793,8 @@ type apiEnvelope struct {
 
 // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
 type Client struct {
-	HTTP *http.Client
+	HTTP      *http.Client
+	ProxyPool *proxypool.Manager
 
 	// refreshMu 保护 refreshing/renewed 两张刷新表：
 	//   refreshing 同一个 refresh token 的在途刷新（并发调用共享结果）；
@@ -850,6 +852,9 @@ type Client struct {
 	// 探测与合并见 global_models.go）。目录权威 = 桌面端 UA 族，见该文件注释。
 	globalModels fetchGlobalModelsCache
 
+	// KeepRecentRounds 只保留最近 N 轮对话（prompt.keep_recent_rounds，issue #99）；
+	// 0 = 关闭。热改由面板保存配置触发，见 payload.go trimHistory。
+	KeepRecentRounds atomic.Int64
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
@@ -1103,7 +1108,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) ([]
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。与 body 归一化共用
 	// prepareBodyOpt 的同一次 map 解析，不再二次 Unmarshal/Marshal。
-	return prepareBodyOpt(body, c.SanitizeFingerprints.Load(), c.brandScopeGlobal(), efforts, defs, maxOut, realm, c.EffortPolicy(), uid, conversationID, true)
+	return prepareBodyOpt(body, c.SanitizeFingerprints.Load(), c.brandScopeGlobal(), efforts, defs, maxOut, realm, c.EffortPolicy(), uid, conversationID, true, int(c.KeepRecentRounds.Load()))
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -1191,8 +1196,8 @@ func (c *Client) webBase(a *auth.Auth) string {
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error) {
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1404,7 +1409,7 @@ func (c *Client) doRefresh(a *auth.Auth, rtSnapshot string) *refreshResult {
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 I/O（锁外，30s 上限）。
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return &refreshResult{err: err, at: time.Now()}
 	}
@@ -1560,7 +1565,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
 		doStart := time.Now()
-		resp, err := c.chatHTTP().Do(req)
+		resp, err := c.do(req, a, true)
 		if timing != nil {
 			timing.Do += max(time.Since(doStart), time.Nanosecond)
 		}
@@ -1900,7 +1905,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, err
 	}
@@ -2365,7 +2370,9 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		return nil, nil, err
 	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// X-Requested-With：**不发**。/v3/config 由 RPC 层（node fetch）打，2026-10-30 双版本
+	// 抓包里该路径主流样本（CLI UA 族）恒无此头；只有渲染器侧另一条链的镜像请求带，
+	// 那是另一族形态，不是我们必须对齐的那条。
 	// AccessToken 加锁快照（同 fetchEnterpriseModels）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	if a != nil && a.UID != "" {
@@ -2380,7 +2387,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		ua = c.v3ProbeUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -23,6 +23,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/prompt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
@@ -109,6 +110,11 @@ type Config struct {
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
 
+	// RecordContext 是否把会话上下文（system + messages）记入请求事件。
+	// 来自 logging.request_archive_context（缺省 false）：提示词是用户数据，
+	// 默认不落盘。热生效，经 livecfg 快照。
+	RecordContext bool
+
 	// EmbeddingsEnabled 实验特性 /v1/embeddings 开关的静态回退（features.embeddings_enabled）。
 	// Live 非 nil 时以热快照为准；裸用/单测路径用本字段。
 	EmbeddingsEnabled bool
@@ -126,6 +132,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		SoftCooldown:      h.cfg.SoftCooldown,
 		EmbeddingsEnabled: h.cfg.EmbeddingsEnabled,
 		RecordClientInfo:  h.cfg.RecordClientInfo,
+		RecordContext:     h.cfg.RecordContext,
 		HiddenModels:      livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
 		AllowedModels:     allowed,
 		AllowlistEnabled:  enabled,
@@ -605,6 +612,10 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			h.declareReasoning(entry, "cn", mi.ID, efforts)
 		}
+		// models.dev 形状的能力声明（modalities/limit/tool_call/reasoning/
+		// reasoning_options）：纯追加，原有字段一个不动；给只认 models.dev 词表的
+		// 下游（magpie 等）一份读得懂的声明。同源派生见 applyModelsDevShape 注释。
+		applyModelsDevShape(entry, mi, efforts, false)
 		out = append(out, entry)
 	}
 	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
@@ -661,6 +672,11 @@ func (h *Handler) modelList() []map[string]any {
 				}
 				h.declareReasoning(entry, "global", id, efforts)
 			}
+			// models.dev 形状与 CN 分支同口径；hasInfo=false 时连能力字段都没有，
+			// 不追加（按裸 ID 输出，不编造）。
+			if hasInfo {
+				applyModelsDevShape(entry, info, efforts, false)
+			}
 			out = append(out, entry)
 		}
 	}
@@ -703,7 +719,11 @@ func (h *Handler) generationModelEntries() []map[string]any {
 				"owned_by":         "workbuddy",
 				"image_generation": true,
 			}
-			out = append(out, applyModelInfoFields(entry, mi))
+			entry = applyModelInfoFields(entry, mi)
+			// 出图模型：modalities.output = ["image"]（没有上下文/输出，limit 自然省略）。
+			// 与对话模型同一份函数，保证两处字段形状一致。
+			applyModelsDevShape(entry, mi, nil, true)
+			out = append(out, entry)
 		}
 	}
 	return out
@@ -820,6 +840,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
+	// 会话上下文（面板「请求事件日志」展开看）：/messages 与 /responses 都先转成
+	// chat 体再进来，所以这一处就覆盖三条入站协议。开关关时为零值 nil，不落盘。
+	if h.loadLive().RecordContext {
+		if tr := requestTraceFrom(r); tr != nil {
+			tr.context = archiveContext(body)
+		}
+	}
 
 	// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本（见
 	// upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的 tools」与
@@ -1275,6 +1302,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						logfmt.Label(acct.UID, acct.Nickname))
 				} else {
 					lastErr = err
+					if proxypool.IsError(err) {
+						break
+					}
 					if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 						h.cfg.Pool.Disable(acct.UID, "refresh session dead")
 					} else {
@@ -1314,6 +1344,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
+			if proxypool.IsError(terr) {
+				break
+			}
 			// 客户端已断连（人走了）例外：传输错误是断连的**结果**，不是这个号的
 			// 错——喂连败会把每次断连都记到当时被选中的号上，几次之后整池逐个被
 			// 降权、且边降边被后续重试刷新，表现为「账号永远解不了封」；换号也只是
@@ -1947,6 +1980,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			hint += "; upstream: " + s
 		}
 		status = http.StatusBadRequest
+	}
+	if proxypool.IsError(lastErr) {
+		status, code, msg, hint = http.StatusServiceUnavailable, "proxy_unavailable", lastErr.Error(), ""
+		retryAfterSec, quotaCode, quota = 0, 0, false
 	}
 	if retryAfterSec > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSec))
