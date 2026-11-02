@@ -43,9 +43,13 @@ var gatewayPaths = map[string]bool{
 	"/metrics":  true,
 }
 
-// gatewayPrefixes 前缀族：/v1/*（chat/responses/messages/models/images/search/fetch 等）、
-// /v2/*、/admin/*。
-var gatewayPrefixes = []string{"/v1/", "/v2/", "/admin/"}
+// gatewayPrefixes 前缀族：/v1/*（chat/responses/messages/models/images/search/fetch/embeddings 等）、
+// /v2/*、/admin/*、**/messages/***。
+//
+// /messages/ 必须单独列：Claude Code 的计数端点是 `POST /messages/count_tokens`，
+// 它没有 /v1 前缀（与 /messages 别名同族）。2026-11-01 上游新增该路由时，
+// 只按精确名登记 /messages 会让它被重写成 /panel/messages/count_tokens → 404。
+var gatewayPrefixes = []string{"/v1/", "/v2/", "/admin/", "/messages/"}
 
 // isGatewayPath 判断是否属于网关自身 API（面板不得接管）。
 func isGatewayPath(p string) bool {
