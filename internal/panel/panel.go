@@ -240,6 +240,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/error_summary", p.errorSummary)
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.requestMetrics)
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.requestLogs)
+	// 清空请求事件归档（issue #160）：日志留存归运营自己管，别只能等定期 prune。
+	p.mux.HandleFunc("POST /panel/api/request_logs/clear", p.requestLogsClear)
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.creditHistory)
 	p.mux.HandleFunc("GET /panel/api/models", p.models)
 	// (账号 × 模型) 手动开关：运维显式禁用某账号的某模型（永久语义，仅手动解）。
@@ -256,6 +258,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.accountDisable)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.accountPause)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.accountResume)
+	// 账号分组标签（issue #159）：纯管理维度，落 state.json，供面板按组筛选与组内批量。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/group", p.accountGroup)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.accountCheckin)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.accountBalance)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.accountRemove)
@@ -561,6 +565,24 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": rows, "limit": limit})
 }
 
+// requestLogsClear 清空归档目录里的请求事件文件（面板「清空归档」）。
+// 只删 requests-*.jsonl，与定期 prune 同口径；目录里的其它文件不碰。
+// 删除由归档写循环执行（它是文件句柄的唯一持有者），所以这一步是串行的、不会把
+// 正在写的文件删成「已删除但仍在写」。
+func (p *Panel) requestLogsClear(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.RequestLog == nil {
+		writeErr(w, http.StatusNotImplemented, "request logger not available")
+		return
+	}
+	res, err := p.cfg.RequestLog.Purge()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	log.Printf("panel: 清空请求事件归档，删除 %d 个文件（%d 字节）", res.Files, res.Bytes)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "files": res.Files, "bytes": res.Bytes})
+}
+
 // creditHistory 返回积分变动流水（新的在前），供「运行日志 → 积分历史」展示。
 // limit 默认 200、上限 1000（与 requestLogs 同口径）；可带 uid 精确过滤。
 // 账号昵称在读取时用池快照填充——账本只存 uid，上游改名后旧流水也跟着更新，
@@ -690,9 +712,11 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 出图模型：目录按 tag 把它们从**对话**列表剔掉了（/v1/models 同样单列），面板
+	// 出图/出视频模型：目录按 tag 把它们从**对话**列表剔掉了（/v1/models 同样单列），面板
 	// 「模型与档位」也必须看得到——否则用户不知道有哪些能调。字段与对话模型同口径，
-	// 另加 image_generation 标记（前端据此标「出图」）。视频不列：没有网关端点。
+	// 另加 image_generation / video_generation 标记（前端据此标「出图」「出视频」）。
+	// 视频端点 2026-11 起已实现（POST /v1/videos/generations + GET /v1/videos/{id}），
+	// 所以视频模型与出图模型同一个口径列出；出图专有的分档实扣（charge_variants）只对 image 生效。
 	//
 	// 倍率口径（2026-10-22 复测，两个个人号直连上游）：
 	//   - 目录**不再给出图模型报 credits**：CN hunyuan-image-alpha 的条目只有
@@ -719,17 +743,21 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for _, mi := range p.cfg.Upstream.GenerationModels(realm) {
-			if mi.GenerationKind != "image" {
+			if mi.GenerationKind != "image" && mi.GenerationKind != "video" {
 				continue
 			}
 			e := panelModelEntry(realm, mi, nil, "", p.cfg.Upstream.HTTP)
-			e["image_generation"] = true
+			if mi.GenerationKind == "video" {
+				e["video_generation"] = true
+			} else {
+				e["image_generation"] = true
+			}
 			// 有牌价也照样带实测（此前只在 credits 为空时才带，导致 CN 的 5.71 被
 			// x5.00 盖住、用户看到的价格比实付低）。
 			if v, ok := measured[realm+":"+mi.ID]; ok {
 				e["measured_credit"] = v
 			}
-			if variants := p.cfg.Upstream.ImageCharges(realm, mi.ID); len(variants) > 0 {
+			if variants := p.cfg.Upstream.ImageCharges(realm, mi.ID); mi.GenerationKind == "image" && len(variants) > 0 {
 				e["charge_variants"] = variants
 				last := variants[0]
 				for _, v := range variants {
@@ -1046,6 +1074,29 @@ func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// accountGroup 设置 / 清除账号分组标签（body: {"group":"..."}，空串 = 取消分组）。
+// 纯管理维度：不参与选号 / 计费 / 鉴权，只影响面板按组筛选与组内批量操作。
+// 返回库里真正落下的值——超长会被池层截断，前端据此回显而不是显示用户输入的原值。
+func (p *Panel) accountGroup(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	var req struct {
+		Group string `json:"group"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if !p.cfg.Pool.SetGroup(uid, req.Group) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	group := ""
+	if st, ok := p.cfg.Pool.Status(uid); ok {
+		group = st.Group
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "group": group})
+}
+
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
@@ -1088,7 +1139,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		p.cfg.Pool.NoteCheckinDone(uid)
 		checkinDone = true
 	}
-	resp := map[string]any{"ok": checkinDone, "realm": "cn", "checkin_done": checkinDone}
+	// realm 取账号真值，不写字面量：上面 global 分支一旦被改（提前返回挪走、门控放宽），
+	// 这里硬写的 "cn" 会让国际号拿到错误回显。
+	resp := map[string]any{"ok": checkinDone, "realm": a.Realm(), "checkin_done": checkinDone}
 	if a.IsEnterprise() {
 		resp["enterprise"] = true
 	}
