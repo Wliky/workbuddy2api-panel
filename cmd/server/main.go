@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof" // WB2API_PPROF 打开时提供 /debug/pprof（默认无监听）
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -159,6 +160,8 @@ func main() {
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring, cfg.ExpiringSoonDur)
 	p.SetAccountPriority(cfg.Pool.AccountPriority) // 账号优先级/占比（issue #62）：空表 = 不启用
 	p.SetAccountShare(cfg.Pool.AccountShare)
+	// 选号策略（pool.selection_strategy）：weighted 缺省 / round_robin / sequential。
+	p.SetStrategy(cfg.Pool.SelectionStrategy)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -213,6 +216,9 @@ func main() {
 	// （kimi-k3-1 实案：全池无观测 → 保底全放行 → 两笔打穿并硬冷却到次日 04:00）。
 	// 位于 up 装配之后：倍率表由探测下发，闭包每次调用读实时快照。
 	p.SetModelRateOf(func(realm, model string) string { return up.ModelRate(realm, model) })
+	// 「免费号调不通」的模型（modelTiers accessMode=exclusive）：知道账号免费就不派给它。
+	// 付费状态来自 billing summary 的 IsPaidUser（顺手记在 upstream 里），没观测过就放行。
+	p.SetExclusiveModels(up.ModelExclusive, up.PaidUser)
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
@@ -229,6 +235,8 @@ func main() {
 	}
 	defer proxies.Close()
 	proxies.SetTLSOver(up.TLSOver) // 经代理的 HTTPS 与直连同一指纹、同一请求头顺序
+	// 出口画像（国家 / 住宅或机房 / ISP）：随健康探测顺手查，查不到就空着，不参与选号。
+	proxies.EnableExitLookup()
 	up.ProxyPool = proxies
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(cfg.Features.SanitizeBrandScope)
@@ -364,6 +372,9 @@ func main() {
 	case cfg.TaskSweepInterval > 0:
 		log.Printf("补领清扫：每 %s（只 accept 待接受的、只 claim 已达标未领的）", cfg.TaskSweepInterval)
 	}
+	if !cfg.Schedule.WindowProbeEnabled {
+		log.Printf("额度窗口探针已禁用（schedule.window_probe_enabled=false）")
+	}
 	if cfg.Schedule.BalanceRefreshJitterPermill > 0 {
 		log.Printf("周期抖动（人味化）：余额刷新 ±%d‰（账号遍历同步摊开）、补领清扫 ±%d‰，不再精确固定间隔（schedule.*_jitter_permill）",
 			cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
@@ -435,10 +446,7 @@ func main() {
 	up.SetCreditObserver(creditHist.Observe)
 	log.Printf("[credithist] 积分历史已启用: %s", stateSibling(cfg.StateFile, "credit-history.json"))
 
-	updateManager := updater.New(appVersion, appRepository, *cfgPath, updater.Settings{
-		AutoEnabled: cfg.Update.AutoEnabled,
-		AutoTime:    cfg.Update.AutoTime,
-	})
+	updateManager := updater.New(appVersion, appRepository, *cfgPath, updateSettingsFrom(cfg))
 	var pn *panel.Panel
 	pn = panel.New(panel.Config{
 		Pool:       p,
@@ -476,10 +484,7 @@ func main() {
 				return nil, err
 			}
 			if saved, loadErr := Load(*cfgPath); loadErr == nil {
-				updateManager.Configure(updater.Settings{
-					AutoEnabled: saved.Update.AutoEnabled,
-					AutoTime:    saved.Update.AutoTime,
-				})
+				updateManager.Configure(updateSettingsFrom(saved))
 			} else if loadErr != nil {
 				log.Printf("WARN: reload update settings: %v", loadErr)
 			}
@@ -488,9 +493,29 @@ func main() {
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
 	})
-	// 任务频道日志落盘（重启后任务结果可回溯）；失败只 WARN，不阻塞启动。
-	if err := pn.Logs().SetTaskArchive(stateSibling(cfg.StateFile, "task-logs.json")); err != nil {
-		log.Printf("WARN: task log archive: %v", err)
+	// 面板运行日志全频道按天落盘（logging.panel_log_*）：重启后回填、支持按区间导出。
+	// 装配顺序必须在 log.SetOutput 之前——回填完再把实时输出接上，否则启动期的
+	// 那几行会先入环、再被回填的历史插到前面，时间序就乱了。
+	var panelLogs *panel.LogStore
+	if cfg.Logging.PanelLogEnabled {
+		panelLogs = panel.NewLogStore(stateSibling(cfg.StateFile, "panel-logs"),
+			cfg.Logging.PanelLogRetentionDays, cfg.Logging.PanelLogMaxMB)
+		if panelLogs == nil {
+			log.Printf("WARN: 面板日志落盘不可用（数据目录建不出来），退回纯内存环")
+		} else {
+			if err := pn.Logs().SetLogStore(panelLogs); err != nil {
+				log.Printf("WARN: 面板日志回填失败（不影响新日志）: %v", err)
+			}
+			defer panelLogs.Close()
+			log.Printf("[panel] 运行日志落盘 %s（保留 %d 天，上限 %d MiB）",
+				panelLogs.Dir(), cfg.Logging.PanelLogRetentionDays, cfg.Logging.PanelLogMaxMB)
+		}
+	}
+	// 兜底：落盘关掉或不可用时，仍用任务频道那份 JSON 快照回填（旧行为）。
+	if panelLogs == nil {
+		if err := pn.Logs().SetTaskArchive(stateSibling(cfg.StateFile, "task-logs.json")); err != nil {
+			log.Printf("WARN: task log archive: %v", err)
+		}
 	}
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
@@ -549,6 +574,11 @@ func main() {
 		BudgetLimit:      cfg.Budget.DailyCreditLimit,
 		BurstCreditLimit: cfg.Budget.BurstCreditLimit,
 		CacheLowRate:     cfg.Budget.CacheLowRate,
+		// 入站请求体 OOM 护栏 + 11140 连坐暂停（两处都只在启动时读，改完需重启）。
+		MaxPayloadBytes: cfg.Server.MaxPayloadBytes,
+		RestrictionHold: time.Duration(cfg.Upstream.RestrictionHoldSeconds) * time.Second,
+		// 等上游首帧期间的 SSE 注释帧间隔（server.head_keepalive，缺省 1.5s）。
+		HeadKeepalive: cfg.HeadKeepaliveDur,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -562,6 +592,11 @@ func main() {
 	defer func() { stopProxies(); <-proxyDone }()
 	updateManager.SetRestart(stop)
 	go updateManager.Run(ctx)
+	// 账号目录热重载（issue #199）：外部同步进来的 auths/*.json 不必重启进程即可入池，
+	// 删文件也会在连续 N 次扫描确认后出池。面板「刷新」按钮之外还提供
+	// POST /panel/api/accounts/reload 给脚本用；间隔 0s 时只保留手动接口。
+	pn.SetReloadConfig(cfg.ReloadIntervalDur, cfg.Accounts.ReloadDeleteConfirm)
+	go pn.ReloadLoop(ctx.Done())
 	// 账号后台任务（taskjobs）：状态与主 state 同目录，重启后自动恢复未完成作业。
 	if err := pn.StartTaskJobs(ctx, stateSibling(cfg.StateFile, "task-jobs.json")); err != nil {
 		p.Flush() // Fatal 绕过 defer：至少把池状态落盘再退
@@ -574,6 +609,12 @@ func main() {
 	sch.SetMakeupCardsPerRound(cfg.Schedule.MakeupCardsPerRound)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
+	// 额度窗口探针：上游按首次请求起算额度窗口，429 重置时刻到了没人发请求窗口就
+	// 不开始（额度空转）。到点主动发一个最小请求把起点钉住。开关见
+	// schedule.window_probe_enabled（缺省开）。
+	if cfg.Schedule.WindowProbeEnabled {
+		sch.StartModelWindowProbe(ctx)
+	}
 	if cfg.Alerting.Enabled {
 		mon := alert.New(alert.Config{
 			Enabled:          true,
@@ -612,6 +653,18 @@ func main() {
 	// 模型归零；倍率表当时尚未建立）。
 	// 异步执行：不阻塞监听启动；失败仅记日志（下一轮懒触发或本轮重试仍可补上）。
 	go warmModelRates(ctx, up, p)
+
+	// 诊断用：WB2API_PPROF=127.0.0.1:6060 时另起一个只跑 pprof 的监听。
+	// 默认不开启（不设环境变量就完全没有这个监听），供「并发一高就降速」这类
+	// 只能靠真实负载定位的 CPU 问题取 profile（取完即关容器，不常驻生产）。
+	if addr := os.Getenv("WB2API_PPROF"); addr != "" {
+		go func() {
+			log.Printf("[pprof] 诊断监听开启 %s（CPU: /debug/pprof/profile?seconds=30）", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				log.Printf("WARN: [pprof] 监听失败 %v", err)
+			}
+		}()
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -789,6 +842,28 @@ func effortPolicyOf(cfg *Config) *upstream.EffortPolicy {
 	}
 }
 
+// updateSettingsFrom 把 config 的 update 段翻成 updater.Settings（issue #198）。
+//
+// 单独抽成函数是因为「启动装配」与「配置保存后热更新」两处必须用同一口 IO——
+// 各写一份字面量时，新增字段必然只接一处（热更新丢了 proxy/mirror，面板看着
+// 保存成功、实际还是旧通道）。
+//
+// proxy_from_env 在 config 里是 *bool：JSON 缺键 = 未表态 → 沿用环境变量（历史
+// 行为，也是绝大多数部署的实际形态）；显式 false 才完全不读环境。
+func updateSettingsFrom(u *Config) updater.Settings {
+	fromEnv := true
+	if u.Update.ProxyFromEnv != nil {
+		fromEnv = *u.Update.ProxyFromEnv
+	}
+	return updater.Settings{
+		AutoEnabled:  u.Update.AutoEnabled,
+		AutoTime:     u.Update.AutoTime,
+		Proxy:        u.Update.Proxy,
+		ProxyFromEnv: fromEnv,
+		Mirror:       u.Update.Mirror,
+	}
+}
+
 func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, gw *server.Handler, pn *panel.Panel, running ...*Config) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
@@ -902,6 +977,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetReserveCreditsByRealm(newCfg.Pool.ReserveCreditsByRealm) // 按域覆盖热生效（issue #147）
 	p.SetAccountPriority(newCfg.Pool.AccountPriority)             // 账号优先级/占比热生效（issue #62）
 	p.SetAccountShare(newCfg.Pool.AccountShare)
+	p.SetStrategy(newCfg.Pool.SelectionStrategy) // 选号策略热生效
 	sch.Reconfigure(scheduler.ScheduleParams{
 		CheckinHours:   newCfg.Schedule.CheckinHours,
 		TravelHours:    newCfg.Schedule.TravelHours,

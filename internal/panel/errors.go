@@ -124,6 +124,16 @@ func kindOf(line string) (kind, code string, sev string) {
 			kind, sev = "上游流解析失败", sevWarn
 		case strings.Contains(line, "[continue]"):
 			kind, sev = "续写降级", sevWarn
+		case strings.Contains(line, "[narration]"):
+			// 预告句救援：模型停在「……：」上被续写。与 toolonly 分开计数，运维才能
+			// 判断是哪条规则在动（issue #209 的建议 3）。
+			kind, sev = "续写救援（预告句）", sevInfo
+		case strings.Contains(line, "[toolonly]"):
+			// 「说一句就停」的救援：命中说明客户端刚才差点看到中途停下，救回来是好事，
+			// 但要能算出救了多少、救回的是工具调用还是只有正文——按 info 记，进「救援」一栏。
+			kind, sev = "续写救援（说一句就停）", sevInfo
+		case strings.Contains(line, "[starved]"):
+			kind, sev = "续写救援（思考吃光预算）", sevInfo
 		case strings.Contains(line, "fetch models"), strings.Contains(line, "global models"),
 			strings.Contains(line, "models.dev fetch"), strings.Contains(line, "model.json"):
 			kind, sev = "模型目录拉取异常", sevWarn
@@ -131,6 +141,17 @@ func kindOf(line string) (kind, code string, sev string) {
 			kind, sev = "积分保底让位", sevInfo
 		case strings.Contains(line, "本次大前缀未命中"):
 			kind, sev = "缓存重算（费用）", sevWarn
+		case strings.Contains(line, "finish_reason=length 正文截断"):
+			// 输出额度用尽被切断（客户端 max_tokens 太小，或思考吃光同一份额度）。
+			// 上游回的是 200 + finish_reason=length，链路本身成功，所以既不是 bad 也不是
+			// 上游故障——单独成一类，运维才能把「回答写到一半停了」与真正的失败分开看。
+			kind, sev = "正文截断（finish=length）", sevWarn
+		case strings.Contains(line, "上游未给终态就结束"):
+			// 上游连接说到一半断开（无 finish_reason、无 [DONE]）。网关已补截断终态，
+			// 客户端知道被截断，但这是上游侧的真故障，值得单独一类盯。
+			// 客户端自己断开的场景不再记这条（见 StreamHint 的 clientGone 判定），
+			// 所以这里看到的都是上游的问题。
+			kind, sev = "上游断流（已补截断终态）", sevWarn
 		case strings.Contains(line, "rotate backoff aborted"):
 			kind, sev = "轮转退避中止", sevInfo
 		default:
@@ -174,7 +195,11 @@ func AggregateErrors(lines []LogLine) []ErrStat {
 
 	for _, ln := range lines {
 		txt := strings.TrimSpace(ln.Text)
-		if !strings.HasPrefix(txt, "WARN") && !strings.HasPrefix(txt, "ERR") {
+		// WARN/ERR 之外，只额外放行「续写救援」这三族（它们是 info 级的好消息，
+		// 但必须能数出来）：其余 INFO 噪音不进汇总。
+		rescue := strings.Contains(txt, "[toolonly]") || strings.Contains(txt, "[narration]") ||
+			strings.Contains(txt, "[starved]")
+		if !rescue && !strings.HasPrefix(txt, "WARN") && !strings.HasPrefix(txt, "ERR") {
 			continue
 		}
 		kind, code, sev := kindOf(txt)

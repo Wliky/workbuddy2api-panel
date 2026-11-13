@@ -59,7 +59,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	case ErrSessionDead:
 		return "account session expired at upstream; the account is disabled until re-login"
 	case ErrHardCredit:
-		return "account credits exhausted at upstream; waiting for daily check-in to restore"
+		// 不能说「等签到恢复」：国际版账号**没有签到活动**（本网关日志：国际版签到
+		// 活动未开启，跳过），积分只能靠充值/订阅恢复。旧文案对 global 号的持有者
+		// 是一个永远不会兑现的承诺（issue #191 的延伸）。
+		return "account credits exhausted at upstream; CN accounts recover via the next daily check-in, global accounts need a top-up"
 	case ErrUpstreamBusy:
 		// 6021 queue.full：渠道级容量满载。措辞明确「不是账号问题、换号无意义」，
 		// 指引客户端短等待后重试（SDK 指数退避天然适配）。
@@ -69,6 +72,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		// 上游明示「直接重试无效，请新建任务」。措辞指向「开新会话」而不是「换个账号
 		// 重试」——换号/重试都必然同样失败。
 		return "request tool-call history is broken (call/result mismatch); upstream rejects this request as-is — start a new conversation instead of retrying"
+	case ErrEmptyContent:
+		// 11151 空段：上游对「某条消息的 text 段是空串」判硬 400。出站前网关已补位，
+		// 客户端能做的是把那条空消息删掉或换新会话——重试必然复现。
+		return "request history contains an empty text block; upstream rejects it as-is — drop that message or start a new conversation"
 	case ErrModelBlocked:
 		return "upstream has no such model on this backend; switch model or retry on another account"
 	case ErrContentBlocked:

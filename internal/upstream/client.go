@@ -53,8 +53,9 @@ const (
 	ErrImageInvalid                     // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrModelParamInvalid                // 11133「参数被模型供应商拒绝」（缺/空 messages、模型不支持图片等）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrClient                           // 其他 4xx / 业务错误
-	ErrUpstreamBusy                     // 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满 → 上游容量信号：不罚号、不轮转，末端 503 透传原文
+	ErrUpstreamBusy                     // 6020/6021 排队满、11134「供应商过载」→ 上游容量信号：不罚号、保留会话粘性，末端 429 + Retry-After 透传原文
 	ErrToolMismatch                     // 11148「tool calls and tool results do not match」 → 请求内容级配对断裂：不罚号、不轮转，末端 400 透传原文
+	ErrEmptyContent                     // 11151「a message has empty content」→ 请求内容级空段（出站已补位，这里是兜底）：不罚号、不轮转，末端 400 透传原文
 )
 
 func (k ErrKind) String() string {
@@ -91,6 +92,8 @@ func (k ErrKind) String() string {
 		return "upstream_busy"
 	case ErrToolMismatch:
 		return "tool_mismatch"
+	case ErrEmptyContent:
+		return "empty_content"
 	default:
 		return "none"
 	}
@@ -501,24 +504,36 @@ func ParseRetryAfter(h http.Header) (time.Duration, bool) {
 	return 0, false
 }
 
-// parseQueueRetryAfter 从 6020/6021 排队响应的 body 抽上游明示的重试等待
-// （data.retry_after，整数秒）。上游把排队口径放在 body 而不是 Retry-After 头
-// （2026-10-28 真机：429 + code 6020，data 含 queue_position/queue_size/
-// retry_after/estimated_wait，头侧无任何等待信息），ParseRetryAfter（只认头）
-// 拿不到。只认结构化 data 字段——msg 是 i18n 键（queue.waiting.title）无数值
-// 可解析，requestId 等恰好含数字的字段不误伤。超过 retryAfterSanity 按异常值
-// 封顶（estimated_wait 是另一个字段，不会误入；防上游口径漂移时把天文数字带回）。
-// 解析不到返回 false，调用方回落本地兜底。
+// parseQueueRetryAfter 从排队/容量信封的 body 抽上游明示的重试等待时长。
+// 两种形态都认（整数秒，超 retryAfterSanity 按异常值封顶）：
+//
+//	6020/6021 排队：data.retry_after。2026-10-28 真机实测 429 + code 6020，data 含
+//	  queue_position/queue_size/retry_after/estimated_wait，头侧无等待信息。
+//	11134 供应商过载：retry_policy.retry_after。2026-11-07 生产实测 500 + code 11134，
+//	  retry_policy={retry:true,retry_after:N}，同样没有 Retry-After 头。
+//
+// ParseRetryAfter（只认头）拿不到这两处口径。只认结构化字段——msg 是 i18n 键无数值
+// 可解析，requestId 等恰好含数字的字段不误伤。解析不到返回 false，调用方回落本地兜底。
 func parseQueueRetryAfter(body []byte) (time.Duration, bool) {
 	var env struct {
 		Data struct {
 			RetryAfter int64 `json:"retry_after"`
 		} `json:"data"`
+		RetryPolicy struct {
+			RetryAfter int64 `json:"retry_after"`
+		} `json:"retry_policy"`
 	}
-	if err := json.Unmarshal(body, &env); err != nil || env.Data.RetryAfter <= 0 {
+	if err := json.Unmarshal(body, &env); err != nil {
 		return 0, false
 	}
-	d := time.Duration(env.Data.RetryAfter) * time.Second
+	secs := env.Data.RetryAfter
+	if secs <= 0 {
+		secs = env.RetryPolicy.RetryAfter
+	}
+	if secs <= 0 {
+		return 0, false
+	}
+	d := time.Duration(secs) * time.Second
 	if d > retryAfterSanity {
 		d = retryAfterSanity
 	}
@@ -661,6 +676,12 @@ func Classify(status int, body string) ErrKind {
 			return ErrSessionDead
 		}
 	}
+	// 11140 的第二种形态（账号风控限制文书）：必须先于 accountFaultMarkers——它不带
+	// "request illegal" 字样，落下去会一路滑到通用 4xx 兜底（ErrClient，只换号不罚号），
+	// 于是同一请求顺着轮转把整池账号挨个送进风控。见 restrict.go。
+	if IsRestricted(body) {
+		return ErrAccountFault
+	}
 	for _, m := range accountFaultMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrAccountFault
@@ -680,6 +701,19 @@ func Classify(status int, body string) ErrKind {
 	// 任意状态码都认（防上游换状态码）；结构化 code 主判，requestId 等字段恰好
 	// 含 "6020"/"6021" 不误伤（hasBusinessCode 只认 "code": 键）。
 	if hasBusinessCode(body, "6020") || hasBusinessCode(body, "6021") {
+		return ErrUpstreamBusy
+	}
+	// 11134「the model provider is temporarily unavailable, please retry later or
+	// switch to another model」：模型供应商侧过载，与账号健康无关（2026-11-07 生产实测
+	// 15 分钟内跨 6 个不同账号同时返回，issue #188）。
+	//
+	// 落 ErrServer 的代价是双向的：①按 5xx 喂熔断/降权（threshold 3 → 30m）把整片
+	// 健康号在高峰期打进冷却；②换号重试撞的是同一个 provider，白耗在途名额，且换号
+	// 打断 session_sticky 的账号级前缀缓存（上游 prompt cache 按账号隔离，同号 97–99%
+	// vs 换号 0–12%）。
+	// 归 ErrUpstreamBusy = 不罚号 + body 侧解析 retry_policy.retry_after 后不轮转，
+	// 与 6020/6021 同一族（上游容量信号，自带重试口径）。
+	if hasBusinessCode(body, "11134") {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
@@ -764,6 +798,15 @@ func Classify(status int, body string) ErrKind {
 	// 不写第二份词表；hint 层的 11133 分支与本分类同源。
 	if status == http.StatusBadRequest && isModelParamInvalid(body) {
 		return ErrModelParamInvalid
+	}
+	// 11151「a message has empty content」：空 text 段被上游判为硬 400。出站前
+	// empty_text_part.go 已经补位（含「字符串被当 parts 嗅探」那种），到这里说明
+	// 补位没覆盖的形态（例如不经 payload 管线的端点），但它是**同一请求的错**：
+	// 换任何账号都会被同一处拒绝，轮转只会白打整池并喂连败。
+	// 只认结构化 code：文案 "empty content" 可能出现在用户自己的消息里，按词判会把
+	// 正常请求误分类成「不再轮转」。
+	if status == http.StatusBadRequest && hasBusinessCode(body, "11151") {
+		return ErrEmptyContent
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
@@ -861,6 +904,13 @@ type Client struct {
 	// 供出站请求体补默认 max_tokens：上游对缺失限额的请求套保守默认（实测
 	// 32000），Codex 等不发限额的客户端写大文件会被无声截断。与 efforts 共用锁。
 	modelMaxOut map[string]map[string]int64
+	// exclusive 该域里「免费号调不通」的模型（modelTiers 的 accessMode=exclusive）。
+	// 与 modelRates 同口径：目录刷新即整体替换，共用锁。
+	exclusive map[string]map[string]bool
+	// paidByUID 各账号「是不是付费号」（billing summary 的 IsPaidUser）。只在拿到
+	// 该字段时写入（目前只有 global 的 summary 给）；缺条目 = 不知道。
+	paidMu   sync.RWMutex
+	paidByUID map[string]bool
 
 	// globalModels 缓存 global 模型目录探测结果（1h TTL + 5min 负缓存；
 	// 探测与合并见 global_models.go）。目录权威 = 桌面端 UA 族，见该文件注释。
@@ -1110,7 +1160,7 @@ func (c *Client) brandScopeGlobal() bool {
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
 // 返回改写后的请求体、客户端原始请求档位与本次实际生效档位
 // （requested 与 effective 的区别见 prepareBodyOpt 注释；issue #43）。
-func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) ([]byte, string, string) {
+func (c *Client) prepareBody(body []byte, realm, uid, conversationID, convReqID string) ([]byte, string, string) {
 	body = prepareKimiTools(body, realm)
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	maxOut := c.modelMaxOutSnapshot(realm)
@@ -1127,7 +1177,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) ([]
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。与 body 归一化共用
 	// prepareBodyOpt 的同一次 map 解析，不再二次 Unmarshal/Marshal。
-	return prepareBodyOpt(body, c.SanitizeFingerprints.Load(), c.brandScopeGlobal(), efforts, defs, maxOut, realm, c.EffortPolicy(), uid, conversationID, true, int(c.KeepRecentRounds.Load()))
+	return prepareBodyOpt(body, c.SanitizeFingerprints.Load(), c.brandScopeGlobal(), efforts, defs, maxOut, realm, c.EffortPolicy(), uid, conversationID, true, int(c.KeepRecentRounds.Load()), convReqID)
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -1282,35 +1332,46 @@ func (e errReader) Read([]byte) (int, error) { return 0, e.err }
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
 func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error) {
+	env, _, err := c.doJSONRaw(req, a)
+	return env.Data, err
+}
+
+// doJSONRaw 同 doJSON，另外把**原始响应体**一并返回。
+//
+// 为什么需要：多数接口是 {code,msg,data} 信封，doJSON 只交 data 就够了；但账号
+// 资料接口 /console/account 在实际环境里出现过两种形态（顶层平铺 uid/nickname 与
+// {code:0,data:{...}} 包装）。平铺形态没有 code 字段，信封解析后 Code=0、Data 为空，
+// 只看 data 会得到一个空对象——调用方必须能拿到原文自己判形态。
+func (c *Client) doJSONRaw(req *http.Request, a *auth.Auth) (apiEnvelope, []byte, error) {
+	var env apiEnvelope
 	resp, err := c.do(req, a, false)
 	if err != nil {
-		return nil, err
+		return env, nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
+		return env, nil, fmt.Errorf("read body: %w", err)
 	}
 	// 必须在 Classify / Unmarshal 之前解压：这两步都按文本处理 raw。
 	if raw, err = decodeResponseBody(resp, raw); err != nil {
-		return nil, err
+		return env, nil, err
 	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		return env, raw, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 	}
-	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
+		return env, raw, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
 	}
 	if env.Code != 0 {
 		kind := Classify(resp.StatusCode, env.Msg)
 		if kind == ErrNone {
 			kind = ErrClient
 		}
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
+		return env, raw, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
 	}
-	return env.Data, nil
+	return env, raw, nil
 }
 
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
@@ -1612,10 +1673,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		ctx = context.Background()
 	}
 	prepStart := time.Now()
-	prepared, requested, effort := c.prepareBody(body, a.Realm(), a.UID, cacheKeySource(meta))
-	// body 侧会话字段（issue #51）：把本轮 ID 同时写进消息体，与出站头保持头体一致
-	// （官方桌面端头与体都带 conversationRequestId）。见 conv_fields.go。
-	prepared = injectConversationFields(prepared, meta.ConversationRequestID)
+	prepared, requested, effort := c.prepareBody(body, a.Realm(), a.UID, cacheKeySource(meta), meta.ConversationRequestID)
 	if timing != nil {
 		// Zero means unmeasured; coarse clocks can report zero for completed work.
 		timing.Prep += max(time.Since(prepStart), time.Nanosecond)
@@ -1678,8 +1736,13 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
 			}
 			kind := Classify(resp.StatusCode, string(raw))
+			// 这一行是排查「上游到底回了什么」的唯一入口，截断长度不能太短：
+			// 200 字符时连 `retry_policy:{retry:true,retry_af…` 都截在值前面（#188
+			// 实案），运维据此判断不了 retry_after 是秒还是毫秒。512 足够把业务码、
+			// 文案、retry_policy 与 requestId 一起带出来，又不至于把日志冲成一片。
+			// Error.Msg 仍按 200 截断——那条会透传给客户端，不跟着放大。
 			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
-				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
+				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 512))
 			// ≥400 直接返回（#119 后 global 单路径 /v2，chat 层无 fallback 链）。
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析）：
 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
@@ -1735,7 +1798,10 @@ type ModelInfo struct {
 	// 「订阅优先」），空=不受限。只透文案不给布尔：海外是 Pro 专属（免费号调不通），
 	// 国内只是「优先调度」（能用，排队靠后），同一个 requiredUserType 两种语义，
 	// 一刀切成「不可用」会把国内这三个模型错标成禁选（issue #235）。
-	Tier              string
+	Tier string
+	// Exclusive accessMode=exclusive：免费号确实调不通（只有这一个字段能这么判，
+	// 文案不能）。选号据此跳过「已知免费」的号，见 pool 的 exclusiveModelOf。
+	Exclusive         bool
 	Vendor            string // vendor 厂商标识
 	IsDefault         bool   // isDefault 是否默认模型
 	SupportsReasoning bool   // supportsReasoning 是否支持推理
@@ -2211,7 +2277,11 @@ type v3ModelTier struct {
 	Enabled  bool     `json:"enabled"`
 	Priority int      `json:"priority"`
 	ModelIDs []string `json:"modelIds"`
-	Badge    *struct {
+	// AccessMode "exclusive" = 免费号根本调不通（海外 Pro Only 的机器可读口径）。
+	// CN 的「订阅优先」没有这个字段，只是排队靠后——把两者混成「不可用」会误拒
+	// 能用的请求（issue #235）。
+	AccessMode string `json:"accessMode"`
+	Badge      *struct {
 		Label string `json:"label"`
 	} `json:"badge"`
 }
@@ -2243,6 +2313,11 @@ func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
 			}
 			best[id] = t.Priority
 			mi.Tier = t.Badge.Label
+			// exclusive 与文案无关：CN 那条「订阅优先」同样带 label 但没有 accessMode，
+			// 落到这里的只有海外 Pro Only 这种真门控。
+			if strings.EqualFold(strings.TrimSpace(t.AccessMode), "exclusive") {
+				mi.Exclusive = true
+			}
 			out[id] = mi
 		}
 	}
@@ -2250,6 +2325,7 @@ func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
 	for _, id := range proOnlyFallback {
 		if mi, ok := out[id]; ok && mi.Tier == "" {
 			mi.Tier = "Pro Only"
+			mi.Exclusive = true // 实测免费号必 11158，与 accessMode=exclusive 同义
 			out[id] = mi
 		}
 	}
@@ -2361,9 +2437,13 @@ func effectiveModelRate(mi ModelInfo) string {
 // 倍率时写入空桶，使旧倍率不会继续冒充当前价。
 func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	rates := make(map[string]string, len(infos))
+	excl := make(map[string]bool)
 	for _, mi := range infos {
 		if mi.ID == "" {
 			continue
+		}
+		if mi.Exclusive {
+			excl[mi.ID] = true
 		}
 		if rate := effectiveModelRate(mi); rate != "" {
 			rates[mi.ID] = rate
@@ -2374,7 +2454,47 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	if c.modelRates == nil {
 		c.modelRates = make(map[string]map[string]string)
 	}
+	if c.exclusive == nil {
+		c.exclusive = make(map[string]map[string]bool)
+	}
 	c.modelRates[realmKey(realm)] = rates
+	c.exclusive[realmKey(realm)] = excl
+}
+
+// ModelExclusive 报告 (域, 模型) 是否「免费号调不通」（modelTiers accessMode=exclusive）。
+// 与 ModelRate 同口径：按 realm 分桶、目录刷新整体替换；未知一律 false（不拦）。
+func (c *Client) ModelExclusive(realm, model string) bool {
+	if c == nil || model == "" {
+		return false
+	}
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	return c.exclusive[realmKey(realm)][model]
+}
+
+// NotePaidUser 记录账号是不是付费号（billing summary 的 IsPaidUser）；只有拿到该字段
+// 时才调用，没调过 = 不知道（选号按「可用」处理，见 pool 的 exclusiveModelOf）。
+func (c *Client) NotePaidUser(uid string, paid bool) {
+	if c == nil || uid == "" {
+		return
+	}
+	c.paidMu.Lock()
+	defer c.paidMu.Unlock()
+	if c.paidByUID == nil {
+		c.paidByUID = make(map[string]bool)
+	}
+	c.paidByUID[uid] = paid
+}
+
+// PaidUser 返回记过的付费状态；第二个返回值为 false 表示没观测过（不是「免费」）。
+func (c *Client) PaidUser(uid string) (paid, known bool) {
+	if c == nil {
+		return false, false
+	}
+	c.paidMu.RLock()
+	defer c.paidMu.RUnlock()
+	paid, known = c.paidByUID[uid]
+	return paid, known
 }
 
 // storeModelMaxOut 按 realm 整体替换模型输出上限快照（maxOutputTokens）。
@@ -2742,13 +2862,26 @@ func parsePackageEndTime(raw string) (time.Time, bool) {
 // deduction=2034-12-24，余额 500 分）。回退 ExpiredTime（仅在包失效后才回填）
 // → CycleEndTime。都缺 → 无到期（保守：不参与「先烧快到期的」排序）。
 func packageEndAt(deductionMS int64, expired, cycleEnd string) (time.Time, bool) {
+	t, _, ok := packageEndAtEx(deductionMS, expired, cycleEnd)
+	return t, ok
+}
+
+// packageEndAtEx 同 packageEndAt，另外回报「是否只能靠 CycleEndTime 推算」。
+//
+// fromCycle=true 表示前两个权威字段都没有，日期是按计量周期末日推的。上游 Bonus
+// Pack 的实测形态里 DeductionEndTime 与 CycleEndTime **完全相同**（2026-11-10 线上
+// 逐行核对，差 0 秒），所以正常情况不会走到这一步；但 CN 侧与历史包可能缺
+// DeductionEndTime，那时日期只是推算——调用方据此打 WARN 并在面板标注，别让运维
+// 把「推算值」当成真实扣费截止。
+func packageEndAtEx(deductionMS int64, expired, cycleEnd string) (time.Time, bool, bool) {
 	if deductionMS > 0 {
-		return time.UnixMilli(deductionMS).In(softRateResetLoc), true
+		return time.UnixMilli(deductionMS).In(softRateResetLoc), false, true
 	}
 	if t, ok := parsePackageEndTime(expired); ok {
-		return t, true
+		return t, false, true
 	}
-	return parsePackageEndTime(cycleEnd)
+	t, ok := parsePackageEndTime(cycleEnd)
+	return t, ok, ok
 }
 
 // ExpiryBucket 单个自然日到期的积分合计（按真实失效时刻 DeductionEndTime 聚合）。
@@ -2760,6 +2893,10 @@ type ExpiryBucket struct {
 	Date     string    `json:"date"`
 	ExpireAt time.Time `json:"expires_at,omitempty"`
 	Remain   int64     `json:"remain"`
+	// Estimated 该日额度里至少有一批的到期日是**按计量周期（CycleEndTime）推算**的，
+	// 不是上游给出的真实扣费截止（缺 DeductionEndTime / ExpiredTime 时的回退）。
+	// 面板据此标注「按计量周期推算」，避免运维把推算值当权威日期（issue #200）。
+	Estimated bool `json:"estimated,omitempty"`
 }
 
 // UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
@@ -3102,11 +3239,11 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 // 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
 // 让该账号整天漏签；「已签到」等业务错误不重试。
+// 需要区分「本次真签到 / 今天早就签过」的调用方用 CheckinReceipt，本函数只保留
+// error 语义给不关心回执的老调用方（调度器 / CLI）。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	return c.retryBillingTransient(func() error {
-		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
-		return err
-	})
+	_, err := c.CheckinReceipt(a)
+	return err
 }
 
 // IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。

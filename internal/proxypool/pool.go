@@ -2,6 +2,7 @@
 package proxypool
 
 import (
+	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -119,6 +120,8 @@ type View struct {
 	Failures    int       `json:"failures"`
 	Successes   int       `json:"successes"`
 	BoundCount  int       `json:"bound_count"`
+	// Exit 出口画像（国家 / 住宅或机房 / ISP / ASN）。空字段 = 不知道，不是「没问题」。
+	Exit ExitInfo `json:"exit"`
 }
 
 type Snapshot struct {
@@ -140,6 +143,9 @@ type ImportResult struct {
 	Status string `json:"status"`
 	ID     string `json:"id,omitempty"`
 	Error  string `json:"error,omitempty"`
+	// Name 订阅里给这个节点的名字（Clash 的 name / URI 的 #fragment）。仅作展示：
+	// 面板据此告诉用户「这条被跳过的是哪个节点」，比只报行号有用得多。
+	Name string `json:"name,omitempty"`
 }
 
 type Manager struct {
@@ -158,6 +164,11 @@ type Manager struct {
 	wake       chan struct{}
 	// Shared by periodic and manual probes, including concurrent HTTP handlers.
 	slots chan struct{}
+	// exit 每个节点的出口画像（ip / 国家 / 住宅或机房 / ISP），见 intel.go。
+	// 持久化不必要：重启后第一次探测会重新取。
+	exit map[string]ExitInfo
+	// lookupExitFn 出口画像的查询函数；nil = 关闭（默认，见 EnableExitLookup）。
+	lookupExitFn func(context.Context) ExitInfo
 }
 
 func New(path string, base *http.Transport, dialer *net.Dialer) (*Manager, error) {
@@ -172,6 +183,7 @@ func New(path string, base *http.Transport, dialer *net.Dialer) (*Manager, error
 		data:   disk{Nodes: []node{}, Bindings: map[string]Binding{}, Realms: map[string]Binding{}, Settings: DefaultSettings()},
 		health: map[string]health{}, generation: map[string]uint64{}, checking: map[string]bool{}, requested: map[string]bool{},
 		transports: map[string]*http.Transport{}, wake: make(chan struct{}, 1), slots: make(chan struct{}, 8),
+		exit: map[string]ExitInfo{},
 	}
 	if path != "" {
 		raw, err := safefile.Read(path, nil)
@@ -308,6 +320,7 @@ func (m *Manager) Snapshot() Snapshot {
 			ID: n.ID, Name: n.Name, URL: u.String(), Protocol: u.Scheme, PasswordSet: passwordSet,
 			Enabled: n.Enabled, Status: status, Checking: m.checking[n.ID], LatencyMS: h.latencyMS,
 			CheckedAt: h.checkedAt, LastError: h.lastError, Failures: h.failures, Successes: h.successes, BoundCount: counts[n.ID],
+			Exit: m.exit[n.ID],
 		})
 	}
 	return s
@@ -323,13 +336,29 @@ func (m *Manager) Import(text string) ([]ImportResult, error) {
 	}
 	results := []ImportResult{}
 	var added []string
-	for i, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
+	// 订阅归一化（subscription.go）：明文 URI / 整段 base64 / Clash YAML 三种形态
+	// 都在这里变成「一行一个受支持的 URL」。认不出的条目带 Reason 回来，按
+	// unsupported / invalid 逐条报账——**不静默丢弃**，否则用户粘了 200 个节点
+	// 只进来 3 个却不知道为什么。
+	entries, err := ParseSubscription(text)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		r := ImportResult{Line: entry.Line, Name: entry.Name}
+		if entry.URL == "" {
+			// 认得出来但协议不支持 → unsupported（面板不计入「无效」，也不把整段
+			// 订阅原样回填到输入框：那对用户没有意义）。真认不出的 → invalid。
+			r.Status = "invalid"
+			if entry.Unsupported {
+				r.Status = "unsupported"
+			}
+			r.Error = entry.Reason
+			results = append(results, r)
 			continue
 		}
-		r := ImportResult{Line: i + 1, Status: "invalid"}
-		u, err := parseURL(line)
+		r.Status = "invalid"
+		u, err := parseURL(entry.URL)
 		if err != nil {
 			r.Error = err.Error()
 		} else if id := seen[u.String()]; id != "" {
@@ -340,7 +369,7 @@ func (m *Manager) Import(text string) ([]ImportResult, error) {
 				return nil, err
 			}
 			id := hex.EncodeToString(b[:])
-			d.Nodes = append(d.Nodes, node{ID: id, Name: u.Host, URL: u.String(), Enabled: true})
+			d.Nodes = append(d.Nodes, node{ID: id, Name: nodeName(u.Host, entry.Name), URL: u.String(), Enabled: true})
 			seen[u.String()] = id
 			added = append(added, id)
 			r.Status, r.ID = "added", id
@@ -356,6 +385,20 @@ func (m *Manager) Import(text string) ([]ImportResult, error) {
 		}
 	}
 	return results, nil
+}
+
+// nodeName 节点显示名：订阅给了名字就用它（最多 128 字节，与 Update 的长度上限
+// 一致），否则沿用 host。截断按字节做而不是按 rune——上限本来就是字节语义
+// （Update 里 len(in.Name) > 128），两个入口必须同一把尺子。
+func nodeName(host, want string) string {
+	name := strings.TrimSpace(want)
+	if name == "" {
+		return host
+	}
+	if len(name) > 128 {
+		name = name[:128]
+	}
+	return name
 }
 
 func (m *Manager) Update(id string, in Input) error {
@@ -419,6 +462,7 @@ func (m *Manager) Update(id string, in Input) error {
 func (m *Manager) resetLocked(id string) {
 	m.generation[id]++
 	delete(m.health, id)
+	delete(m.exit, id) // 换了地址就是换了出口，旧画像不能留着
 	if tr := m.transports[id]; tr != nil {
 		tr.CloseIdleConnections()
 		delete(m.transports, id)
