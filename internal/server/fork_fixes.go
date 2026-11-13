@@ -33,23 +33,26 @@ import (
 // 本项目的网关路由比上一代多，逐个补上：
 //
 //	/messages          Anthropic Messages 别名（注意：没有 /v1 前缀）
+//	/messages/*        Claude Code 计数端点 /messages/count_tokens
 //	/v2/chat/busy      官方客户端的「模型忙」预检
 //	/metrics           Prometheus 指标（metrics.enabled 时才挂）
 //	/admin/*           管理任务触发（admin.enabled 时才挂）
+//	/mcp               MCP 端点（GET+POST，2026-11 上游新增，同样没有 /v1 前缀）
 var gatewayPaths = map[string]bool{
 	"/healthz":  true,
 	"/status":   true,
 	"/messages": true,
 	"/metrics":  true,
+	"/mcp":      true,
 }
 
-// gatewayPrefixes 前缀族：/v1/*（chat/responses/messages/models/images/search/fetch/embeddings 等）、
-// /v2/*、/admin/*、**/messages/***。
+// gatewayPrefixes 前缀族：/v1/*（chat/responses/messages/models/images/videos/search/fetch/embeddings 等）、
+// /v2/*、/admin/*、**/messages/***、/mcp/*。
 //
 // /messages/ 必须单独列：Claude Code 的计数端点是 `POST /messages/count_tokens`，
 // 它没有 /v1 前缀（与 /messages 别名同族）。2026-11-01 上游新增该路由时，
 // 只按精确名登记 /messages 会让它被重写成 /panel/messages/count_tokens → 404。
-var gatewayPrefixes = []string{"/v1/", "/v2/", "/admin/", "/messages/"}
+var gatewayPrefixes = []string{"/v1/", "/v2/", "/admin/", "/messages/", "/mcp/"}
 
 // isGatewayPath 判断是否属于网关自身 API（面板不得接管）。
 func isGatewayPath(p string) bool {
