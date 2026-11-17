@@ -479,7 +479,7 @@ $('btnLogout').onclick = () => {
 };
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', proxies: '代理池', usage: '用量', packages: '积分构成', balhist: '余额趋势', taskscenter: '任务中心', models: '模型与档位', config: '配置', events: '请求事件日志', logs: '运行日志' };
+const TITLES = { accounts: '账号池', proxies: '代理池', usage: '用量', packages: '积分构成', balhist: '余额趋势', taskscenter: '任务中心', models: '模型与档位', config: '配置', events: '请求事件日志', logs: '运行日志', modelrules: '模型规则' };
 function go(v) {
   navSet(false);
   view = v;
@@ -487,6 +487,7 @@ function go(v) {
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
+  if (v === 'modelrules') loadModelRules();
   if (v === 'config') loadConfig();
   if (v === 'proxies') loadProxies();
   // 切到日志视图：本地窗口为空（首次）时全量拉一次；已有窗口则继续增量。
@@ -635,6 +636,10 @@ function renderAccounts(list) {
       credTip = (s.enterprise ? '企业版剩余额度 ' : '剩余 ')
         + s.credits + ' / ' + (s.enterprise ? '分配 ' : '总额 ') + s.credits_total + '（' + pct + '%）';
     } else credTip = '积分（相对池内最高）';
+    // 禁用号的 credits 是「当前可用量」= 0（见 pool.activeCredits），真实冻结快照在
+    // credits_raw。行内仍显示 0（可用），但把快照放进 tooltip：否则运维看不到死号里
+    // 还压着多少积分，误以为余额被清空了。
+    if (s.disabled && s.credits_raw > 0) credTip += '\n已禁用：可用 0，冻结快照 ' + s.credits_raw;
     const costs = (s.model_costs || []).filter(c => c.model);
     if (costs.length) {
       credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
@@ -2534,6 +2539,8 @@ start();
 /* ── 积分任务 ─────────────────────────────────────────────────────── */
 let taskUID = null, taskCapabilities = { accept: false, claim: false, automate: false };
 let taskJobTimer = null, taskJobPolling = null, taskJobID = null, taskJobGeneration = 0;
+// taskAutoTimer 账号任务弹窗的静默刷新定时器（30s），关闭弹窗即停。
+let taskAutoTimer = null;
 let taskJobsLoading = false;
 
 // 服务端状态与界面反馈共用的纯函数，避免把已提交/失败当成已完成。
@@ -2652,9 +2659,15 @@ function openTasks(uid) {
   $('btnTaskReload').hidden = false;
   loadTasks();
   loadAccountTaskJob(uid);
+  // 弹窗开着期间定时静默刷新：上游任务进度是分钟级聚合，30 秒一轮足够跟上，
+  // 又不会让用户为了看到变化去点「重新加载」。
+  if (taskAutoTimer) clearInterval(taskAutoTimer);
+  taskAutoTimer = setInterval(() => { if (taskUID === uid) loadTasks(true); }, 30000);
 }
 function closeTasks() {
   taskJobGeneration++;
+  if (taskAutoTimer) clearInterval(taskAutoTimer);
+  taskAutoTimer = null;
   $('taskVeil').classList.remove('on'); taskUID = null; taskJobID = null;
   if (taskJobTimer) clearInterval(taskJobTimer);
   taskJobTimer = null;
@@ -2796,14 +2809,134 @@ function groupsFromJobs(jobs) {
 }
 $('btnTaskJobsReload').onclick = () => { taskCenterOwner = 'jobs'; loadTaskJobs(); };
 
-async function loadTasks() {
+/* ── 实时任务 ─────────────────────────────────────────────────────────
+   数据源：GET /panel/api/tasks/live（后端按 45s TTL 缓存，一行一个账号的当前任务表）。
+   为什么要这块：既有的「后台任务」只在作业跑过之后才有内容，「扫描待办」要手动点，
+   两者都得有人先动一下，看板永远滞后。这里进页面就自动拉、按间隔自动刷。
+
+   轮询只在「本页可见 + 浏览器在前台」时跑：切走就停，避免后台标签页把上游当靶子练。
+   间隔拿到后端 ttl_sec 做下限——比 TTL 还短只是打自己的缓存，没意义。 */
+let liveTimer = null, liveEvery = 45, liveLoading = false, liveTTL = 45;
+function liveTaskRow(t) {
+  // 上游 Task：claimed / claimable 是本地推算，status 是上游原文
+  const st = t.claimed ? 'done' : t.claimable ? 'claim_pending' : (t.locked ? 'skipped' : 'scan');
+  const prog = (t.progress_known && t.target > 0) ? (t.current + '/' + t.target) : '';
+  const gain = (t.credit ? '+' + t.credit + 'c' : '') + (t.energy ? ' +' + t.energy + 'e' : '');
+  return qrowHTML({
+    code: t.task_code,
+    title: t.title,
+    desc: t.task_desc || t.description,
+    status: st,
+    prog: prog,
+    message: [t.task_desc || t.description, gain.trim()].filter(Boolean).join(' · '),
+  });
+}
+function renderLiveTasks(d) {
+  const list = $('liveList'), empty = $('liveEmpty'), note = $('liveNote');
+  const accts = (d && d.accounts) || [];
+  if (d && d.ttl_sec) liveTTL = d.ttl_sec;
+  const groups = accts.filter(a => (a.tasks || []).length || a.error).map(a => ({
+    uid: a.uid,
+    nick: a.nickname || String(a.uid).slice(0, 8),
+    cnt: a.error ? '查询失败' : ((a.pending || 0) + ' 待办 · ' + (a.claimable || 0) + ' 可领 · ' + (a.claimed || 0) + ' 已领'),
+    tip: a.error || '',
+    rows: a.error
+      ? [{ code: '(账号)', title: a.nickname || String(a.uid).slice(0, 8), status: 'error', message: a.error }]
+      : (a.tasks || []).map(liveTaskRow),
+  }));
+  if (!groups.length) {
+    list.innerHTML = ''; empty.style.display = '';
+    empty.querySelector('.t').textContent = '还没有数据';
+    empty.querySelector('.d').textContent = '点「立即刷新」拉一次。';
+    $('liveSummary').textContent = '';
+    return;
+  }
+  empty.style.display = 'none';
+  let pending = 0, claimable = 0;
+  accts.forEach(a => { pending += a.pending || 0; claimable += a.claimable || 0; });
+  list.innerHTML = groups.map(g =>
+    '<div class="qgroup" title="' + esc(g.tip) + '"><header><span class="nm">' + esc(g.nick) + '</span>' +
+    '<span class="cnt">' + esc(g.cnt) + '</span><span class="grow"></span>' +
+    '<button class="xs" data-live-uid="' + esc(g.uid) + '">打开任务</button></header>' +
+    g.rows.map(qrowHTML).join('') + '</div>').join('');
+  $('liveSummary').textContent = accts.length + ' 个账号 · ' + pending + ' 待办 · ' + claimable + ' 可领' +
+    (d && d.cached ? ' · ' + (d.age_sec || 0) + ' 秒前' : ' · 刚更新');
+  note.hidden = true;
+}
+async function loadLiveTasks(fresh) {
+  if (liveLoading) return;
+  liveLoading = true;
+  const btn = $('btnLiveReload');
+  if (btn) btn.disabled = true;
+  try {
+    const d = await api('tasks/live' + (fresh ? '?fresh=1' : ''));
+    renderLiveTasks(d);
+  } catch (e) {
+    const note = $('liveNote');
+    note.hidden = false;
+    note.className = 'state err';
+    note.textContent = '实时任务查询失败：' + e.message;
+  } finally {
+    liveLoading = false;
+    if (btn) btn.disabled = false;
+  }
+}
+function liveTasksTick() {
+  if (view !== 'taskscenter' || document.hidden) return;
+  // 间隔比后端 TTL 短只会读缓存；按实际 TTL 抬到下限，避免无谓轮询。
+  if (liveEvery < liveTTL) liveEvery = liveTTL;
+  loadLiveTasks(false);
+}
+let liveVisBound = false;
+function startLiveTasks() {
+  // 可见性监听只绑一次，且放在这里而不是模块顶层：前端测试会把这一段单独切到
+  // 没有 document 的沙箱里求值，顶层绑定会直接 ReferenceError。
+  if (!liveVisBound && typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && view === 'taskscenter') loadLiveTasks(false);
+    });
+    liveVisBound = true;
+  }
+  loadLiveTasks(false);
+  if (liveTimer) clearInterval(liveTimer);
+  liveTimer = null;
+  if (liveEvery > 0) liveTimer = setInterval(liveTasksTick, liveEvery * 1000);
+}
+if ($('liveEvery')) {
+  $('liveEvery').value = String(liveEvery);
+  $('liveEvery').onchange = ev => {
+    liveEvery = Number(ev.target.value) || 0;
+    try { localStorage.setItem('wb2api.liveEvery', String(liveEvery)); } catch (e) { /* 隐私模式 */ }
+    if (liveTimer) clearInterval(liveTimer);
+    liveTimer = liveEvery > 0 ? setInterval(liveTasksTick, liveEvery * 1000) : null;
+  };
+  // typeof 守卫同上：前端测试会把这一段单独切出来在无 localStorage 的沙箱里求值。
+  const savedRaw = typeof localStorage !== 'undefined' ? localStorage.getItem('wb2api.liveEvery') : null;
+  if (savedRaw !== null && savedRaw !== '') {
+    const saved = Number(savedRaw);
+    if (saved >= 0) { liveEvery = saved; $('liveEvery').value = String(saved); }
+  }
+}
+if ($('btnLiveReload')) $('btnLiveReload').onclick = () => loadLiveTasks(true);
+if ($('liveList')) {
+  $('liveList').addEventListener('click', ev => {
+    const b = ev.target.closest('button[data-live-uid]');
+    if (b) openTasks(b.dataset.liveUid);
+  });
+}
+
+async function loadTasks(silent) {
   if (!taskUID) return;
   const uid = taskUID;
   const st = $('taskState'), tb = $('taskTable');
-  st.hidden = false;
-  st.className = 'state';
-  st.innerHTML = '<span class="dots">查询中</span>';
-  tb.hidden = true;
+  // silent = 定时静默刷新：不闪「查询中」、失败也不清空表格——轮询抖动不该把
+  // 用户正在看的列表打空。
+  if (!silent) {
+    st.hidden = false;
+    st.className = 'state';
+    st.innerHTML = '<span class="dots">查询中</span>';
+    tb.hidden = true;
+  }
   try {
     const d = await api('accounts/' + encodeURIComponent(uid) + '/tasks');
     if (taskUID !== uid) return;
@@ -2838,6 +2971,7 @@ async function loadTasks() {
     tb.hidden = false;
   } catch (e) {
     if (taskUID !== uid) return;
+    if (silent) return; // 静默刷新失败：保留上一份列表，别把界面打空
     taskCapabilities = { accept: false, claim: false, automate: false };
     $('btnTaskAcceptAll').hidden = true;
     $('btnTaskAutoAll').hidden = true;
@@ -3065,6 +3199,10 @@ function reattachQueueView() {
     taskCenterOwner = 'jobs';
     loadTaskJobs();
   }
+  // 实时任务卡独立于下面的队列/作业列表，进本页即拉一次并接管轮询。
+  // typeof 守卫：本文件有测试会把 reattachQueueView 单独切出来求值（不带上
+  // startLiveTasks），无守卫会 ReferenceError 把整段测试打断。
+  if (typeof startLiveTasks === 'function') startLiveTasks();
   // 全程异步：go() 在顶层（app.js ~143 行）被调用时，本文件下方 let/const
   //（queueTimer/lastQueueSeq 等）尚未初始化——同步读取即 TDZ ReferenceError
   // 使整个脚本中断。await 之后才碰它们（旧 pollQueueOnce 正是靠开头的 await
@@ -5940,3 +6078,397 @@ for (const [id, realm] of [['proxyRealmCn', 'cn'], ['proxyRealmGlobal', 'global'
     await loadProxies(true);
   };
 }
+// >>> modelrules-app
+/* ── 模型规则（黑/白名单） ────────────────────────────────────────────
+   背景：贵模型只给少数账号用，其余账号只用便宜常用的——一个账号把额度打穿，
+   整个池子连便宜模型都跟着不可用。逐条点 model_toggle 太慢（账号 × 模型几十上百
+   个组合），所以做成「规则」：一批模型的黑/白名单，挂到账号上即刻生效。
+   判定在后端 internal/pool/modelrules.go，与手动单点开关取并集，都优先于自动冷却。 */
+let mrRules = [];        // [{id,name,mode,models,note,accounts}]
+let mrAssign = {};       // uid -> [ruleId]
+let mrCatalog = null;    // [{key,label}] 模型目录，key 带 cn:/global: 前缀
+let mrEditing = null;    // 正在编辑的规则对象；null = 新建
+let mrAccUid = '';       // 正在配置规则的账号
+let mrPick = new Set();  // 编辑弹窗里已勾选的模型 id（带前缀）
+let mrApplyRule = null;   // 「应用」弹窗正在处理的规则
+let mrApplyPick = new Set(); // 应用弹窗里勾选的 uid（勾上 = 要挂这条规则）
+
+/* 模型目录：一次拿全，**保留 cn:/global: 前缀**——两边的同名模型是两套上游、
+   两拨账号，剥掉前缀就分不清「禁的是哪一个」了。失败不抛给调用方：
+   规则列表仍可用（只是勾选面板为空），并给一条可见提示。 */
+async function mrLoadCatalog() {
+  if (mrCatalog) return mrCatalog;
+  const seen = new Map();
+  try {
+    const d = await api('models');
+    for (const m of (d.models || [])) {
+      const id = String(m.id || '').trim();
+      if (!id || seen.has(id)) continue;
+      seen.set(id, { key: id, label: m.name || id });
+    }
+  } catch (e) {
+    toast('模型目录读取失败：' + e.message, 'err');
+  }
+  mrCatalog = [...seen.values()].sort((a, b) => a.key.localeCompare(b.key));
+  return mrCatalog;
+}
+
+async function loadModelRules() {
+  const box = $('mrRuleList');
+  // 账号列取自 overview（与「账号池」页同一份快照）；深链直接进本页时先补一次。
+  if (!overviewData) { try { await loadOverview(true); } catch (e) { /* 失败就空着，下面渲染空态 */ } }
+  if (!mrRules.length) box.innerHTML = '<div class="empty"><div class="big">读取中…</div></div>';
+  try {
+    const d = await api('model_rules');
+    mrRules = d.rules || [];
+    mrAssign = d.assignments || {};
+  } catch (e) {
+    box.innerHTML = '<div class="empty"><div class="big">读取失败</div>' + esc(e.message) + '</div>';
+    return;
+  }
+  renderRuleList();
+  renderRuleAccounts();
+  mrLoadCatalog();
+}
+
+function renderRuleList() {
+  const box = $('mrRuleList');
+  $('mrRuleNote').textContent = mrRules.length ? mrRules.length + ' 条' : '';
+  if (!mrRules.length) {
+    box.innerHTML = '<div class="empty"><div class="big">还没有规则</div>新建一条，勾一批模型，再挂到账号上</div>';
+    return;
+  }
+  box.innerHTML = mrRules.map(r => {
+    const deny = r.mode !== 'allow';
+    const chips = r.models.slice(0, 10).map(m => '<span class="chip">' + esc(m) + '</span>').join('');
+    const more = r.models.length > 10 ? '<span class="chip mute">+' + (r.models.length - 10) + '</span>' : '';
+    // 带 cn:/global: 前缀的模型只对该域账号生效（跨域账号挂上等于没挂，见
+    // pool.recomputeRulesLocked），卡片上标出来，避免「明明挂了白名单却没生效」。
+    const realms = Array.from(new Set(r.models.map(m => {
+      const i = String(m).indexOf(':');
+      return i > 0 ? String(m).slice(0, i) : '';
+    })));
+    const scoped = realms.every(Boolean) && realms.length > 0;
+    const realmTag = scoped
+      ? '<span class="note" title="带 ' + esc(realms.join('/')) + ': 前缀的模型只对该域账号生效，跨域账号挂上等于没挂">仅 ' + esc(realms.join('/')) + ' 域</span>'
+      : '';
+    return '<div class="rule" data-id="' + esc(r.id) + '">' +
+      '<div class="rule-hd">' +
+        '<span class="tag ' + (deny ? 'bad' : 'ok') + '">' + (deny ? '黑名单' : '白名单') + '</span>' +
+        '<b class="rule-nm">' + esc(r.name) + '</b>' +
+        '<span class="note">' + r.models.length + ' 个模型 · ' + (r.accounts || 0) + ' 个账号</span>' + realmTag +
+        '<span class="grow"></span>' +
+        '<button class="xs" data-act="apply">应用</button>' +
+        '<button class="xs" data-act="edit">编辑</button>' +
+        '<button class="xs" data-act="del">删除</button>' +
+      '</div>' +
+      '<div class="chips rule-models">' + chips + more + '</div>' +
+      (r.note ? '<div class="hint rule-note">' + esc(r.note) + '</div>' : '') +
+    '</div>';
+  }).join('');
+}
+
+function renderRuleAccounts() {
+  const tb = $('mrAccBody');
+  const list = ((overviewData && overviewData.accounts) || []).slice().sort((a, b) => String(a.uid).localeCompare(String(b.uid)));
+  const byId = new Map(mrRules.map(r => [r.id, r]));
+  $('mrAccNote').textContent = list.length ? list.length + ' 个账号' : '';
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="3"><div class="empty"><div class="big">账号池是空的</div>先到「账号池」添加账号</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = list.map(s => {
+    const ids = mrAssign[s.uid] || [];
+    const chips = ids.map(id => {
+      const r = byId.get(id);
+      if (!r) return '';
+      return '<span class="tag ' + (r.mode === 'allow' ? 'ok' : 'bad') + '">' + esc(r.name) + '</span>';
+    }).filter(Boolean).join(' ');
+    const short = String(s.uid).length > 16 ? String(s.uid).slice(0, 16) + '…' : String(s.uid);
+    const nm = remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>');
+    return '<tr>' +
+      '<td class="who"><div class="nm">' + nm + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div>' +
+        '<div class="id">' + esc(short) + '</div></td>' +
+      '<td>' + (chips || '<span class="mr-dash">-</span>') + '</td>' +
+      '<td class="num"><button class="xs" data-uid="' + esc(s.uid) + '">配置</button></td>' +
+    '</tr>';
+  }).join('');
+}
+
+/* 规则编辑弹窗。rule 为空 = 新建；models 预勾选。 */
+async function openRuleDlg(rule) {
+  mrEditing = rule || null;
+  mrPick = new Set(rule ? rule.models : []);
+  $('ruleTitle').textContent = rule ? '编辑规则 · ' + rule.name : '新建规则';
+  $('ruleName').value = rule ? rule.name : '';
+  $('ruleMode').value = rule ? (rule.mode === 'allow' ? 'allow' : 'deny') : 'deny';
+  $('ruleQ').value = '';
+  $('ruleVeil').classList.add('on');
+  $('rulePick').innerHTML = '<div class="empty"><div class="big">读取模型目录…</div></div>';
+  await mrLoadCatalog();
+  renderRulePick();
+}
+
+function renderRulePick() {
+  const q = ($('ruleQ').value || '').trim().toLowerCase();
+  const cat = mrCatalog || [];
+  const list = q ? cat.filter(m => m.key.toLowerCase().includes(q) || String(m.label).toLowerCase().includes(q)) : cat;
+  const box = $('rulePick');
+  if (!list.length) {
+    box.innerHTML = '<div class="empty"><div class="big">没有匹配的模型</div>' + (cat.length ? '换个关键词' : '模型目录是空的，可能上游不可达') + '</div>';
+    updateRuleCount();
+    return;
+  }
+  box.innerHTML = list.map(m => {
+    const on = mrPick.has(m.key);
+    return '<label class="pick' + (on ? ' on' : '') + '" data-key="' + esc(m.key) + '">' +
+      '<input type="checkbox"' + (on ? ' checked' : '') + '>' +
+      '<span class="pk-nm">' + esc(m.key) + '</span>' +
+    '</label>';
+  }).join('');
+  const scope = $('pickScopeNote');
+  if (scope) scope.textContent = q ? '全选/反选只作用于筛出的 ' + list.length + ' 个' : '';
+  updateRuleCount();
+}
+
+function updateRuleCount() {
+  const n = mrPick.size;
+  $('ruleCount').textContent = n ? '已选 ' + n + ' 个模型' : '还没勾任何模型';
+}
+
+function closeRuleDlg() { $('ruleVeil').classList.remove('on'); }
+
+async function saveRule() {
+  const name = ($('ruleName').value || '').trim();
+  if (!name) { toast('先给规则起个名字', 'err'); $('ruleName').focus(); return; }
+  if (!mrPick.size) { toast('至少勾一个模型', 'err'); return; }
+  const body = {
+    id: mrEditing ? mrEditing.id : '',
+    name,
+    mode: $('ruleMode').value,
+    models: [...mrPick],
+  };
+  try {
+    await api('model_rules', { method: 'POST', body: JSON.stringify(body) });
+  } catch (e) {
+    toast('保存失败：' + e.message, 'err');
+    return;
+  }
+  closeRuleDlg();
+  toast('已保存规则「' + name + '」', 'ok');
+  loadModelRules();
+}
+
+/* 按规则批量挂账号（规则卡片上的「应用」）。
+   勾选集合就是「这条规则要挂到哪些账号」：勾上 = 挂、取消 = 摘，
+   保存时只把「变了的那部分账号」发给后端（一个请求搞定，不用逐个账号弹窗）。 */
+function openAccPickDlg(rule) {
+  mrApplyRule = rule;
+  const picked = new Set();
+  Object.keys(mrAssign || {}).forEach(uid => {
+    if ((mrAssign[uid] || []).includes(rule.id)) picked.add(uid);
+  });
+  mrApplyPick = picked;
+  $('accPickTitle').textContent = '应用规则 · ' + rule.name;
+  $('accPickQ').value = '';
+  $('accPickVeil').classList.add('on');
+  renderAccPick();
+}
+
+function accPickRows() {
+  const q = ($('accPickQ').value || '').trim().toLowerCase();
+  const list = ((overviewData && overviewData.accounts) || []).slice();
+  list.sort((a, b) => String(a.nickname || a.uid).localeCompare(String(b.nickname || b.uid)));
+  if (!q) return list;
+  return list.filter(s => String(s.uid).toLowerCase().includes(q) ||
+    String(s.nickname || '').toLowerCase().includes(q) ||
+    String((typeof remarkOf === 'function' && remarkOf(s.uid)) || '').toLowerCase().includes(q));
+}
+
+function renderAccPick() {
+  const box = $('accPickList');
+  const rows = accPickRows();
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty"><div class="big">没有匹配的账号</div></div>';
+    updateAccPickCount();
+    return;
+  }
+  box.innerHTML = rows.map(s => {
+    const on = mrApplyPick.has(s.uid);
+    const nm = remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>');
+    const realm = s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '';
+    return '<label class="pick' + (on ? ' on' : '') + '" data-uid="' + esc(s.uid) + '">' +
+      '<input type="checkbox"' + (on ? ' checked' : '') + '>' +
+      '<span class="pk-nm">' + nm + realm + '</span>' +
+      '<span class="pk-rm">' + esc(String(s.uid).slice(0, 8)) + '</span>' +
+    '</label>';
+  }).join('');
+  updateAccPickCount();
+}
+
+function updateAccPickCount() {
+  const n = mrApplyPick.size;
+  $('accPickCount').textContent = n ? '已勾 ' + n + ' 个账号' : '还没勾任何账号';
+}
+
+function bulkAccPick(mode) {
+  accPickRows().forEach(s => {
+    const on = mode === 'all' ? true : mode === 'none' ? false : !mrApplyPick.has(s.uid);
+    if (on) mrApplyPick.add(s.uid); else mrApplyPick.delete(s.uid);
+    const el = $('accPickList').querySelector('.pick[data-uid="' + s.uid + '"]');
+    if (!el) return;
+    el.classList.toggle('on', on);
+    const cb = el.querySelector('input');
+    if (cb) cb.checked = on;
+  });
+  updateAccPickCount();
+}
+
+async function saveAccPick() {
+  const rule = mrApplyRule;
+  if (!rule) return;
+  const all = ((overviewData && overviewData.accounts) || []);
+  const add = [], del = [];
+  all.forEach(s => {
+    const had = (mrAssign[s.uid] || []).includes(rule.id);
+    const want = mrApplyPick.has(s.uid);
+    if (want && !had) add.push(s.uid);
+    if (!want && had) del.push(s.uid);
+  });
+  if (!add.length && !del.length) { $('accPickVeil').classList.remove('on'); return; }
+  try {
+    if (add.length) {
+      await api('model_rules/apply', { method: 'POST', body: JSON.stringify({ id: rule.id, uids: add, assigned: true }) });
+    }
+    if (del.length) {
+      await api('model_rules/apply', { method: 'POST', body: JSON.stringify({ id: rule.id, uids: del, assigned: false }) });
+    }
+  } catch (e) {
+    toast('保存失败：' + e.message, 'err');
+    return;
+  }
+  $('accPickVeil').classList.remove('on');
+  toast('已应用「' + rule.name + '」：新增 ' + add.length + ' 个、移除 ' + del.length + ' 个账号', 'ok');
+  loadModelRules();
+}
+
+/* 账号挂规则 */
+function openAccRuleDlg(uid) {
+  mrAccUid = uid;
+  const s = ((overviewData && overviewData.accounts) || []).find(x => x.uid === uid) || {};
+  $('accRuleTitle').textContent = '配置规则 · ' + (s.nickname || String(uid).slice(0, 16));
+  $('accRuleVeil').classList.add('on');
+  renderAccRulePick();
+}
+
+function renderAccRulePick() {
+  const ids = new Set(mrAssign[mrAccUid] || []);
+  const box = $('accRuleList');
+  if (!mrRules.length) {
+    box.innerHTML = '<div class="empty"><div class="big">还没有规则</div>先到左栏新建一条</div>';
+    return;
+  }
+  box.innerHTML = mrRules.map(r => {
+    const on = ids.has(r.id);
+    return '<label class="pick' + (on ? ' on' : '') + '" data-id="' + esc(r.id) + '">' +
+      '<input type="checkbox"' + (on ? ' checked' : '') + '>' +
+      '<span class="pk-nm">' + esc(r.name) + '</span>' +
+      '<span class="pk-rm">' + (r.mode === 'allow' ? '白名单' : '黑名单') + ' · ' + r.models.length + ' 模型</span>' +
+    '</label>';
+  }).join('');
+}
+
+async function saveAccRule() {
+  const ids = [...$('accRuleList').querySelectorAll('.pick.on')].map(el => el.dataset.id);
+  try {
+    await api('accounts/' + encodeURIComponent(mrAccUid) + '/model_rules', {
+      method: 'POST', body: JSON.stringify({ ids }),
+    });
+  } catch (e) {
+    toast('保存失败：' + e.message, 'err');
+    return;
+  }
+  $('accRuleVeil').classList.remove('on');
+  toast('已更新该账号的规则', 'ok');
+  loadModelRules();
+}
+
+$('btnRuleNew').onclick = () => openRuleDlg(null);
+$('btnRuleCancel').onclick = closeRuleDlg;
+$('btnRuleSave').onclick = saveRule;
+$('ruleQ').oninput = renderRulePick;
+$('btnAccPickCancel').onclick = () => $('accPickVeil').classList.remove('on');
+$('btnAccPickSave').onclick = saveAccPick;
+$('accPickQ').oninput = renderAccPick;
+$('accPickList').addEventListener('change', e => {
+  const label = e.target.closest('.pick');
+  if (!label) return;
+  const uid = label.dataset.uid;
+  if (e.target.checked) mrApplyPick.add(uid); else mrApplyPick.delete(uid);
+  label.classList.toggle('on', e.target.checked);
+  updateAccPickCount();
+});
+Array.from(document.querySelectorAll('.rbar button[data-accpick]')).forEach(btn => {
+  btn.onclick = () => bulkAccPick(btn.dataset.accpick);
+});
+$('btnAccRuleCancel').onclick = () => $('accRuleVeil').classList.remove('on');
+$('btnAccRuleSave').onclick = saveAccRule;
+
+$('rulePick').addEventListener('change', e => {
+  const label = e.target.closest('.pick');
+  if (!label) return;
+  const key = label.dataset.key;
+  if (e.target.checked) mrPick.add(key); else mrPick.delete(key);
+  label.classList.toggle('on', e.target.checked);
+  updateRuleCount();
+});
+
+/* 全选 / 取消选择 / 反选：只作用于「当前看得见的模型」（搜索过滤后就是过滤结果），
+   免得用户筛完再点全选却把没显示的也一起选中。 */
+function bulkPick(mode) {
+  const labels = Array.from(document.querySelectorAll('#rulePick .pick'));
+  labels.forEach(label => {
+    const key = label.dataset.key;
+    const on = mode === 'all' ? true : mode === 'none' ? false : !mrPick.has(key);
+    if (on) mrPick.add(key); else mrPick.delete(key);
+    label.classList.toggle('on', on);
+    const cb = label.querySelector('input');
+    if (cb) cb.checked = on;
+  });
+  updateRuleCount();
+}
+Array.from(document.querySelectorAll('.pick-bar button[data-pick]')).forEach(btn => {
+  btn.onclick = () => bulkPick(btn.dataset.pick);
+});
+
+$('accRuleList').addEventListener('change', e => {
+  const label = e.target.closest('.pick');
+  if (label) label.classList.toggle('on', e.target.checked);
+});
+
+$('mrRuleList').addEventListener('click', async e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const card = btn.closest('.rule');
+  const rule = mrRules.find(r => r.id === card.dataset.id);
+  if (!rule) return;
+  if (btn.dataset.act === 'apply') { openAccPickDlg(rule); return; }
+  if (btn.dataset.act === 'edit') { openRuleDlg(rule); return; }
+  if (btn.dataset.act === 'del') {
+    if (!confirm('删除规则「' + rule.name + '」？挂了它的账号会立刻恢复按原逻辑选号。')) return;
+    try {
+      await api('model_rules/delete', { method: 'POST', body: JSON.stringify({ id: rule.id }) });
+    } catch (err) {
+      toast('删除失败：' + err.message, 'err');
+      return;
+    }
+    toast('已删除规则「' + rule.name + '」', 'ok');
+    loadModelRules();
+  }
+});
+
+$('mrAccBody').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-uid]');
+  if (btn) openAccRuleDlg(btn.dataset.uid);
+});
+// <<< modelrules-app

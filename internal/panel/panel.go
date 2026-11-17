@@ -274,6 +274,13 @@ func (p *Panel) routes() {
 	// (账号 × 模型) 手动开关：运维显式禁用某账号的某模型（永久语义，仅手动解）。
 	// 与上游触发的临时冷却（6004/11102）正交，且手动优先。
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/model_toggle", p.modelToggle)
+	// 模型规则（面板「模型规则」页）：一批模型的黑/白名单，挂到账号上即刻影响选号。
+	// 与 model_toggle 的手动单点开关并存，两者任一命中都会把该 (账号, 模型) 判为不可用。
+	p.mux.HandleFunc("GET /panel/api/model_rules", p.modelRules)
+	p.mux.HandleFunc("POST /panel/api/model_rules", p.modelRuleSave)
+	p.mux.HandleFunc("POST /panel/api/model_rules/delete", p.modelRuleDelete)
+	p.mux.HandleFunc("POST /panel/api/model_rules/apply", p.modelRuleApply)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/model_rules", p.accountModelRules)
 	// 封禁账号探活：只读探测上游是否已解封，不 revive、不参与选号。
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/probe_ban", p.accountProbeBan)
 	p.mux.HandleFunc("POST /panel/api/login/start", p.loginStart)
@@ -314,6 +321,10 @@ func (p *Panel) routes() {
 	// 只做「读 + 领」——任务本身要客户端真实会话，服务端侧伪造不计数（见 docs/campaign-probe.md）。
 	p.mux.HandleFunc("GET /panel/api/campaign", p.campaignStatus)
 	p.mux.HandleFunc("POST /panel/api/campaign/claim", p.campaignClaim)
+	// 实时任务：直接向每个账号查一次任务表并按 TTL 缓存，供看板定时轮询。
+	// 与 tasks/jobs（后台作业结果）、tasks/scan_all（手动扫描）互补：那两个都要
+	// 有人先动一下，这里不需要。
+	p.mux.HandleFunc("GET /panel/api/tasks/live", p.tasksLive)
 	p.mux.HandleFunc("GET /panel/api/usage", p.usage)
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.usageSave)
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.modelProbes)
@@ -1439,6 +1450,10 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 // balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），
 // 完成后返回——面板紧接着拉 overview 即是最新值。账号量小（个位数），
 // 同步等待（上限受短 RPC 超时约束）比"触发后盲刷"体验更确定。
+//
+// 日志带调用来源：这条路径**只能**由面板 refresh 按钮触发，运维看到「没人点也刷新了」
+// 时无从判断是谁打的（issue #249），把 RemoteAddr/UA 打出来即可区分浏览器误触、
+// 开着旧标签页的机器、或持有面板 key 的脚本。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	if !p.tryStartBatch(w, "全量余额刷新") {
 		return
@@ -1450,7 +1465,7 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	}
 	p.cfg.Scheduler.RunBalanceRefreshNow()
 	p.syncNicknames()
-	log.Printf("panel: 手动全量余额刷新完成")
+	log.Printf("panel: 手动全量余额刷新完成 src=%s ua=%q", r.RemoteAddr, r.UserAgent())
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
 }
 
