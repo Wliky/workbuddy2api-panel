@@ -37,13 +37,24 @@ import (
 // narrationNudge 救援续写的指令。与 continueNudge 的差别：那条针对「撞长度上限」，
 // 强调不要重复；这条针对「自己以为说完了」，必须点明「你停在一句预告上」，
 // 否则模型会以为任务已完成而再重复一遍结论。
-const narrationNudge = "你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，剩余内容还没写。请紧接着把剩下的部分写完：需要查看文件、执行命令或调用工具就直接调用，不要重复已经写过的内容，不要重新开头，不要道歉或解释。"
+//
+// 末尾的出口是防假阳性：判据误触发时，模型否则会写一整段自辩（真机原话「上一条回复
+// 并未中断，也没有以冒号结尾…」），那段自辩直接进客户端正文。
+//
+// 出口要求的是**零输出**而不是「只回一句『已完成』」：正文是边收边转发的，发出去就
+// 收不回来（`r.frame` 收到 content delta 立刻 emit），那三个字会原样拼在正文末尾
+// （issue #273 现象 3：52B + 9B = 61B，与日志逐字节对得上）。
+//
+// 两条指令都以【】前缀自报身份（issue #273 第二条评论）：这条消息是以 role=user 追加的，
+// agent 类客户端分辨不出它与真实用户输入的区别，实测被当成「用户批准」去改了工作区配置
+// （客户端历史里还查不到）。前缀不能阻止模型执行，至少让它不再伪装成用户授权。
+const narrationNudge = "【wb2api 网关自动续写·非用户消息】你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，剩余内容还没写。请紧接着把剩下的部分写完：需要查看文件、执行命令或调用工具就直接调用，不要重复已经写过的内容，不要重新开头，不要道歉或解释。如果你确实已经写完了，什么都不要输出，直接结束这一轮。"
 
 // narrationPromiseNudge 尾部是「我将…/我会…」这类承诺句时用这条。
 //
 // 不能复用上一句：那条说「停在冒号上」，而承诺句既没有冒号也不是预告排版，模型会
 // 反过来跟你争「上一条并未中断」（真机实测原话），争论也会一并写进客户端正文。
-const narrationPromiseNudge = "你上一条回复最后停在「我将…」「我会…」这类承诺句上就结束了，承诺的动作没有执行。请直接执行它：需要查看文件、执行命令或调用工具就直接调用，不要解释为什么停下，不要重复已经写过的内容，不要重新开头。"
+const narrationPromiseNudge = "【wb2api 网关自动续写·非用户消息】你上一条回复最后停在「我将…」「我会…」这类承诺句上就结束了，承诺的动作没有执行。请直接执行它：需要查看文件、执行命令或调用工具就直接调用，不要解释为什么停下，不要重复已经写过的内容，不要重新开头。如果你确实已经写完了，什么都不要输出，直接结束这一轮。"
 
 // toolCallMarkupMarkers 模型把工具调用写成**文本标记**时用到的特征串。
 //
@@ -121,57 +132,91 @@ func hasToolCallMarkup(text string) bool {
 //
 // 判据取「措辞 + 问号」，不猜语义：宁可漏救（客户端自己重试一轮的代价是几秒），
 // 也不能替用户按下发送键。
+//
+// 这一组是明确对用户说的话，出现在正文任何位置都算：确认请求后面常跟着草稿本身
+// （"请确认后我再发送。\n\n收件人：…\n主题：…"），只看最后一句就会把草稿当成末句、漏掉它。
+// 英文项都是小写（与 strings.ToLower 后的正文比）。
 var userYieldMarkers = []string{
-	"请确认", "确认后", "等你确认", "待你确认", "等你回复", "等你确认后",
-	"是否需要", "需不需要", "要不要我", "要不要", "你希望", "请告知",
-	"让我知道", "请你确认", "你确认后", "确认无误", "可以吗", "行吗", "好吗",
+	"请确认", "请你确认", "你确认后", "等你确认", "待你确认", "等你回复", "让我知道",
+	"please confirm", "let me know",
 }
 
-// userYieldMarkersEN 英文形态（模型偶发用英文收尾）。
-var userYieldMarkersEN = []string{
-	"please confirm", "let me know", "should i ", "do you want", "would you like",
-	"awaiting your", "waiting for your", "confirm before", "shall i ",
+// userYieldDeliberation 也能用来问用户、但同样常见于技术叙述的措辞（上游真机样本：4083 字正文
+// 停在「我将开始修改 internal/verify/check.go」上，命中的是三千字之前的「为“是否需要更换”
+// 提供量化支撑」；同类还有「staging 确认后再上线」「日志格式确认无误」「如有问题请告知维护者」）。
+// 预告句救援对它们只认三种位置（见 yieldsToUser）：最后一句里；正文最后一个问句里、且问句之后
+// 只剩没有句读的内容（草稿行）；后面紧跟「我 / 你」（"确认后我再发送"，「我们 / 你们」不算）。
+// toolonly 仍按整段认——那条会采纳工具调用，正文又短，宁可少救。
+var userYieldDeliberation = []string{
+	"是否需要", "需不需要", "要不要", "确认后", "确认无误", "请告知", "你希望",
+	"可以吗", "行吗", "好吗",
+	"should i ", "shall i ", "do you want", "would you like", "awaiting your", "waiting for your", "confirm before",
 }
 
-// yieldTailBytes 判「等用户回话」时最多扫末尾这么长的窗口（最后一句过长时兜底）。
-const yieldTailBytes = 200
-
-// yieldTail 取「最后一次句读之后」的窗口：交回控制权总是最后一句里的事，中段甚至
-// 紧邻尾部的「是否需要」都可能是技术叙述（真实样本：结尾是「…为是否需要更换提供量化
-// 支撑。\n\n---\n\n我将开始修改 check.go」，含 200B 窗口也挡掉了救援）。
-// 按最后一句判，承诺句那一段里没有措辞就照常救。
-func yieldTail(s string) string {
-	// 先剥掉末尾的句读：末句完整结束（"…请确认后我再发送。"）时，最后那个句号后面
-	// 是空的，按它切会切出空串，等于放弃判据。
-	s = strings.TrimRight(s, "。！？!?\n ")
-	if i := strings.LastIndexAny(s, "。！？!?\n"); i >= 0 {
-		_, n := utf8.DecodeRuneInString(s[i:])
-		s = s[i+n:]
-	}
-	return tailOf(strings.TrimSpace(s), yieldTailBytes)
-}
-
-// textYieldsToUser 报告这段正文是否在「等用户回话」：以问号收尾，或末句含请确认类措辞。
+// textYieldsToUser 报告这段正文是否在「等用户回话」：以问号收尾，或含请确认类措辞（整段）。
 //
 // 注意问号收尾在 narrationTailSuspends 里被判为「说完了」（句末标点），所以这条判据
 // 必须独立成立——它挡的是「模型主动提问后停下」这个正确行为，而不是「话没说完」。
-func textYieldsToUser(text string) bool {
-	t := strings.TrimSpace(text)
+func textYieldsToUser(text string) bool { return yieldsToUser(text, true) }
+
+// yieldsToUser 同 textYieldsToUser；deliberationAnywhere=false 时 userYieldDeliberation 只按
+// 它注释里的三种位置认（预告句救援用，issue #245）。
+func yieldsToUser(text string, deliberationAnywhere bool) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
 	if t == "" {
 		return false
 	}
 	if strings.HasSuffix(t, "？") || strings.HasSuffix(t, "?") {
 		return true
 	}
-	tail := yieldTail(t)
-	for _, m := range userYieldMarkers {
-		if strings.Contains(tail, m) {
-			return true
+	if containsAnyOf(t, userYieldMarkers) {
+		return true
+	}
+	if deliberationAnywhere {
+		return containsAnyOf(t, userYieldDeliberation)
+	}
+	return containsAnyOf(toolOnlyLastSentence(t), userYieldDeliberation) ||
+		containsAnyOf(trailingQuestion(t), userYieldDeliberation) ||
+		deliberationAddressesUser(t)
+}
+
+// trailingQuestion 正文最后一个问句——前提是它之后只剩没有句读的内容（"要不要现在发送？\n
+// 收件人：…\n主题：…"，问句后面是草稿行）。问句之后还有完整的句子，说明模型接着往下说了，
+// 那个问句只是叙述的一部分，返回空串。
+func trailingQuestion(t string) string {
+	i := strings.LastIndexAny(t, "？?")
+	if i < 0 {
+		return ""
+	}
+	_, n := utf8.DecodeRuneInString(t[i:])
+	if strings.ContainsAny(t[i+n:], "。！？!?") {
+		return ""
+	}
+	return toolOnlyLastSentence(t[:i+n])
+}
+
+// deliberationAddressesUser 正文里的 userYieldDeliberation 后面是否紧跟「我」「你」
+// （"确认后我再发送"、"是否需要我先发给你过目"）。「我们 / 你们」是叙述主语，不算。
+func deliberationAddressesUser(t string) bool {
+	for _, m := range userYieldDeliberation {
+		for rest := t; ; {
+			i := strings.Index(rest, m)
+			if i < 0 {
+				break
+			}
+			rest = rest[i+len(m):]
+			if (strings.HasPrefix(rest, "我") || strings.HasPrefix(rest, "你")) &&
+				!strings.HasPrefix(rest, "我们") && !strings.HasPrefix(rest, "你们") {
+				return true
+			}
 		}
 	}
-	low := strings.ToLower(tail)
-	for _, m := range userYieldMarkersEN {
-		if strings.Contains(low, m) {
+	return false
+}
+
+func containsAnyOf(s string, subs []string) bool {
+	for _, m := range subs {
+		if strings.Contains(s, m) {
 			return true
 		}
 	}
@@ -194,6 +239,44 @@ func narrationTailStructurallyOpen(text string) bool {
 		return true
 	}
 	return strings.Count(strings.TrimRight(text, " \t\r\n"), "```")%2 == 1
+}
+
+// narrationPromiseMarkers 承诺下一步动作的措辞（"我将开始修改…"、"我需要先读取…"、"let me check…"）。
+// 「接下来 / 下一步」单独出现不收：它们也常用来对用户说话（"接下来你可以运行 npm test"），
+// 长正文里认它们会把写完的回答续写一段；带上动作的「接下来开始 / 现在开始」才收。
+var narrationPromiseMarkers = []string{
+	"我将", "我会", "我先", "我要", "我来", "我继续", "我现在", "让我",
+	"我需要", "我得", "我打算", "我开始", "我再", "我接着", "我还要", "我马上", "我这就",
+	"我们接着", "接下来开始", "现在开始", "正在",
+	"let me", "let's", "i'll", "i will", "i'm ", "i am going to", "i need to", "i should", "now i",
+}
+
+// narrationPromiseNoise 含承诺词却不是承诺的固定说法，匹配前先剔掉（"对我来说" 里的「我来」）。
+var narrationPromiseNoise = []string{"我来说", "我来看"}
+
+// narrationTailPromises 最后一句是否在预告下一步动作（长正文无标点收尾时救援的前提，issue #245）：
+// 含 narrationPromiseMarkers，或以现在分词开头的英文旁白（"Reading failfirst.sh mutation script"，
+// 见 narrationTailSuspends 的样本）。
+func narrationTailPromises(text string) bool {
+	last := strings.ToLower(strings.TrimSpace(toolOnlyLastSentence(text)))
+	for _, n := range narrationPromiseNoise {
+		last = strings.ReplaceAll(last, n, "")
+	}
+	for _, m := range narrationPromiseMarkers {
+		if strings.Contains(last, m) {
+			return true
+		}
+	}
+	first, _, _ := strings.Cut(last, " ")
+	if len(first) < 5 || !strings.HasSuffix(first, "ing") {
+		return false
+	}
+	for _, c := range first {
+		if c < 'a' || c > 'z' {
+			return false
+		}
+	}
+	return true
 }
 
 // tailHangPunct 标点型悬停的收尾符（后面必然还有东西）。
@@ -251,7 +334,10 @@ func narrationTailSuspends(text string) bool {
 		return true
 	}
 	// 句末标点与收尾符：正常说完的形态。
-	if strings.ContainsRune("。.!！?？\"'”’）)》】]}`*~&", last) {
+	// `>` 也归这一类：`<face:…>` / `<sticker:…>` / `<br>` 这类标签闭合即意味着说完了，
+	// 而角色扮演客户端的正文几乎都以表情标签收尾、通篇不写句号（issue #273 原样本
+	// "怎么啦妈 ||| 是干活累着了吗 <face:抱抱>"，52B 每条都被续写一次）。
+	if strings.ContainsRune("。.!！?？\"'”’）)》】]}`*~&>", last) {
 		return false
 	}
 	return true
@@ -303,53 +389,89 @@ const narrationMaxRescues = 2
 // 返回 true 表示已换到新段继续读，调用方直接 return。
 func (r *continueReader) tryNarrationRetry() bool {
 	switch {
-	case r.narrationTries >= narrationMaxRescues, r.errSeen, r.toolSeen, r.clientGone(), r.outputCapped():
-		return false
+	case r.narrationOff:
+		return r.skip("narration", "disabled")
+	case r.narrationTries >= narrationMaxRescues:
+		return r.skip("narration", "tries_cap")
+	case r.errSeen:
+		return r.skip("narration", "err_frame")
+	case r.toolSeen:
+		return r.skip("narration", "tool_seen")
+	case r.clientGone():
+		return r.skip("narration", "client_gone")
+	case r.outputCapped():
+		return r.skip("narration", "output_capped")
 	case r.finish != "stop":
-		return false
+		return r.skip("narration", "finish_not_stop")
 	case r.text.Len() == 0:
-		return false
+		return r.skip("narration", "no_text")
+	case r.text.Len() == r.narrationTextAt:
+		// 上一次救援一个字都没写出来：再发的请求体与上一次一字不差，只是再付一次整段上下文的钱。
+		return r.skip("narration", "no_new_text")
 	case r.atSegmentCap():
-		return false
+		return r.skip("narration", "segment_cap")
 	}
 	txt := r.text.String()
 	// 模型在等用户拍板（问句结尾 / 「请确认后我再…」）：这是**故意的**收尾。
 	// 补一句「继续执行下一步」会拿到工具调用并被采纳，等于替用户按下发送键
 	// （issue #209 两例：要确认的邮件被直接群发）。
-	if textYieldsToUser(txt) {
-		return false
+	// 「是否需要 / 要不要」这类也常见于技术叙述的措辞只认问用户的用法（见 deliberationAddressesUser）。
+	if yieldsToUser(txt, false) {
+		return r.skip("narration", "yields_to_user")
 	}
-	// 长度闸门只约束「标点型悬停」：那是排版习惯（说明 + 列表以冒号收尾，issue #209），
-	// 整段越长越可能是正常排版。无标点悬停是句子被掐断（"我将…"/"我会…"），与正文
-	// 长度无关——长会话里恰好最常见，按整段长度挡掉会导致一条都不救（issue #245）。
-	// 结构上确实没写完的（未闭合代码块 / 截断的调用标记）同样不受此限。
-	if narrationTailPunctuated(txt) && !narrationTailStructurallyOpen(txt) && len(txt) > narrationMaxBytes {
-		return false
+	// 救援指令早些时候的出口是「只回一句『已完成』」。文案已经换成「什么都不要输出」
+	// （issue #273：那三个字会进客户端正文），但模型按旧习惯照回的情况仍会有——认它，
+	// 免得白付第二次整段上下文。
+	// 按后缀判而不是按「最后一句」判：续写段是直接拼上去的，与上一条之间没有分隔符，
+	// toolOnlyLastSentence 会把两句连成一句。
+	if tail := strings.TrimRight(txt, " 	\r\n「」\"'*_。"); strings.HasSuffix(tail, "已完成") ||
+		strings.HasSuffix(strings.ToLower(tail), "done") {
+		return r.skip("narration", "ack_done")
+	}
+	// 两道形态闸门都不让「聊天文风」过关（issue #273：角色扮演机器人「一两句 + ||| 分条 +
+	// <face:…> 收尾、基本不写句号」，既不是标点型悬停也不是承诺句，于是每条正常回复都被
+	// 续写一次——实测 87 次/天，单条计费 0.2 → 8.58 credits）：
+	//   - 标点型悬停（"说明 + 列表："，issue #209）只救短正文，整段越长越可能是正常排版；
+	//   - 无标点悬停必须含承诺词（"我将…"/"我会…"，issue #245）——那是句子被掐断的唯一
+	//     可靠信号；长总结的最后一行（列表项、表格行、「全部测试通过 ✅」、文件路径）不含
+	//     承诺词，一律放开的话每次都要重付一遍整段上下文。
+	// 结构上确实没写完的（未闭合代码块 / 截断的调用标记）不受这两条限制。
+	if !narrationTailStructurallyOpen(txt) {
+		if narrationTailPunctuated(txt) {
+			if len(txt) > narrationMaxBytes {
+				return r.skip("narration", "tail_punct_long")
+			}
+		} else if !narrationTailPromises(txt) {
+			return r.skip("narration", "tail_no_promise")
+		}
 	}
 	if !narrationTailSuspends(txt) {
-		return false
+		return r.skip("narration", "tail_ends_sentence")
 	}
 	// 结构未闭合（截断的调用标记 / 未闭合代码块）只补一次：残缺标记留在前缀里，
 	// 追加正文补不完它（续写段写多少都还是半截），再救也只是白花一次上游调用。
 	if narrationTailStructurallyOpen(txt) && r.narrationTries >= 1 {
-		return false
+		return r.skip("narration", "structural_retry_cap")
 	}
 	declared, toolTurn := bodyToolShape(r.body)
 	if !declared || !toolTurn {
-		return false
+		return r.skip("narration", "no_tool_history")
 	}
 	nudge := narrationNudge
-	if !narrationTailPunctuated(txt) {
-		// 无标点悬停（承诺句）用另一条指令：说成「停在冒号上」模型会反过来争辩。
+	if !narrationTailPunctuated(txt) && !narrationTailStructurallyOpen(txt) {
+		// 无标点悬停（承诺句）用另一条指令：说成「停在冒号上」模型会反过来争辩。截断的调用标记、
+		// 未闭合代码块同样没有标点，但它们不是承诺句：告诉模型「你承诺的动作没执行」是答非所问。
 		nudge = narrationPromiseNudge
 	}
 	body, err := r.continuationBodyWithNudge(nudge)
 	if err != nil {
-		return false
+		return r.skip("narration", "body_build_failed")
 	}
 	r.narrationTries++
+	r.narrationTextAt = r.text.Len()
+	noteRescue("narration")
 	// 异步换段：等待期内客户端只会收到 keepalive（见 openSegmentAsync）。
-	return r.openSegmentAsync(body, func(rc io.ReadCloser) {
+	return r.openSegmentAsync(switchNarration, body, func(rc io.ReadCloser) {
 		r.seg++
 		r.cur, r.br = rc, bufio.NewReaderSize(rc, 64*1024)
 		r.finish, r.tail = "", nil

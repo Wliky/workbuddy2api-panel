@@ -1042,6 +1042,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
+        <!-- 今日救援：网关替「停在半句上」的回复补发的续写次数。每条都要多打一次上游、
+             重付整段 prompt，异常升高就是假阳性（issue #273）。 -->
+        <div class="stat"><div class="v" id="sRescue" title="narration / toolonly / starved">-</div><div class="k">今日救援</div></div>
       </div>
 
       <!-- 到期提醒：数据取 /overview 的 credits_expiry_buckets（签到与余额后台刷新
@@ -1213,11 +1216,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header>
           <h3>实时任务 <span class="hint" id="liveSummary"></span></h3>
           <span class="grow"></span>
-          <label class="sel-note" title="每次轮询向每个账号查一次任务表（上游只读）">自动刷新
+          <label class="sel-note" title="每轮向每个启用账号查一次任务表（上游只读），默认 2 分钟一轮">自动刷新
             <select id="liveEvery">
               <option value="0">关</option>
-              <option value="45" selected>45 秒</option>
-              <option value="120">2 分钟</option>
+              <option value="60">1 分钟</option>
+              <option value="120" selected>2 分钟</option>
               <option value="300">5 分钟</option>
             </select>
           </label>

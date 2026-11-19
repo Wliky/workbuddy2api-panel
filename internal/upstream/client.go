@@ -226,6 +226,32 @@ func isPromptTooLongStatus(status int) bool {
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var alreadyCheckinMarkers = []string{"已签到", "already"}
 var badParamsMarkerCode = `"code":11101`
+var badParamsMarkerFuncParams = `invalid function call parameters`
+var badParamsMarkerFuncParamsAlt = `invalid_function_parameters`
+
+// badParamsMarkers11129 11129「invalid function call parameters」（displayMsg「工具定义不合规」）的文案
+// 形态，已小写化，与 strings.ToLower(body) 比对；中文原文无大小写，同样可比。业务码 11129 不在这里：
+// 走 hasBusinessCode（见 isToolSchemaRejected），容忍空白、字符串形态与嵌套。
+var badParamsMarkers11129 = []string{
+	badParamsMarkerFuncParams,
+	badParamsMarkerFuncParamsAlt,
+	"invalid_function_call_parameters",
+	"工具定义不合规",
+}
+
+// isToolSchemaRejected 判定「工具定义被上游整体拒收」：11129（schema 形态不合规，
+// displayMsg「工具定义不合规」）与 11152（工具名不合规或重名，displayMsg「工具名称
+// 不规范」）都属同一类——错在客户端声明的 tools，换任何账号都是同一处拒绝。
+// 业务码精确命中（容忍空白/字符串形态/嵌套），或文案命中（首帧 error 帧里 message
+// 可能是英文原文、下划线形态或中文 displayMsg）。lower 须为 strings.ToLower(body)。
+//
+// 11152 是 2026-11-18 真机实测补进来的：工具名带点/冒号/斜杠/CJK/空格、或两个同名
+// 工具，上游一律 400 11152。此前未登记 → 落到 Classify 通用 4xx 兜底 → ErrClient →
+// 喂连败、轮转全池、末端 503 no_healthy_account，把一个确定性请求错误伪装成账号故障。
+func isToolSchemaRejected(body, lower string) bool {
+	return hasBusinessCode(body, "11129") || hasBusinessCode(body, "11152") ||
+		containsAnyMarker(lower, badParamsMarkers11129)
+}
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -829,7 +855,7 @@ func Classify(status int, body string) ErrKind {
 		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
 		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让
 		// （吸收上游 fd5c5a6）。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) || isToolSchemaRejected(body, lower) {
 			return ErrBadParams
 		}
 		return ErrClient
@@ -2617,6 +2643,9 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		ua = c.v3ProbeUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
+	// X-Client-*：真机 /v3/config 3/3 条都带（含 CLI 两段式 UA 那条），
+	// 证明注入挂在共享 HTTP 层而非某个 RPC 模块上。按 realm 隔离注入。
+	c.injectClientIdentityHeaders(req, a)
 	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, nil, err
