@@ -627,6 +627,17 @@ function renderAccounts(list) {
         '<div style="margin-top:2px;opacity:.85">' + esc(s.reason) + '</div></div>'
       : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now(), s.realm);
+    // 不可续期（issue #296）：上游已判死 refresh token，access token 一到期就再没有
+    // 自动续期路径。与冷却/限流不同，它等不回来——必须在那天之前手工重登，所以要把
+    // 到期倒计时直接写在行里，而不是让人自己去翻 auths 里的 JWT。
+    const renewNote = s.renew_dead
+      ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' +
+        '<span class="tag bad" style="margin-right:6px">不可续期</span>' +
+        (s.access_expires
+          ? esc(pkExpiryText(new Date(s.access_expires).getTime())) + '后断服务，需重新登录'
+          : 'access token 到期即断服务，需重新登录') +
+        '</div>'
+      : '';
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
     // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
@@ -674,7 +685,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm"><span class="nm-name" title="' + esc(rawWho) + '">' + nameHtml + '</span>' + tags + '</div><div class="id" title="uid: ' + esc(s.uid) + '">' + esc(short) + '</div>' + accountProxyHTML(s.uid) + '</td>' +
-      '<td>' + tag + note + rateLimits + '</td>' +
+      '<td>' + tag + note + rateLimits + renewNote + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -4112,9 +4123,20 @@ function renderExpiryDistribution(list, now) {
         ';flex:' + Math.max(0.008, segment.amount / total).toFixed(4) +
         ' 1 0" title="' + esc(title) + '" aria-label="' + esc(title) + '"></span>';
     }).join('');
-    return '<div class="pk-expiry-row"><span>' + esc(row.days === 0 ? '已到期' : row.days + ' 天') +
-      '</span><div class="pk-expiry-track">' + nodes + '</div><b>' + esc(fmtTok(row.credits)) +
-      '</b></div>';
+    // 每段金额默认只在 hover 的 title 里，行尾只有该日合计（issue #294：段宽接近时
+    // 27 和 30 分不出）。9px 高的色条塞不下常驻文字，故把行做成 <details>：点开
+    // 该行就给全部段落的账号/来源/金额/到期，一次点击替代逐段悬停；不加按钮、不加
+    // 状态，summary 由浏览器自带开关。
+    const detail = row.segments.map(segment => {
+      const color = colors.get(segment.uid) || 'var(--accent)';
+      return '<div><i style="background:' + color + '"></i><b>' + esc(fmtTok(segment.amount)) +
+        '</b><span>' + esc(segment.accountName) + ' · ' + esc(segment.source) + ' · ' +
+        esc(pkExpiryDateTime(segment.expiresAt)) + '</span></div>';
+    }).join('');
+    return '<details class="pk-expiry-row">' +
+      '<summary><span>' + esc(row.days === 0 ? '已到期' : row.days + ' 天') + '</span>' +
+      '<div class="pk-expiry-track">' + nodes + '</div><b>' + esc(fmtTok(row.credits)) + '</b></summary>' +
+      '<div class="pk-expiry-detail">' + detail + '</div></details>';
   }).join('');
   const foot = summary.accountCount + ' 个账号' +
     (summary.unavailable ? ' · ' + summary.unavailable + ' 个未获取余额' : '');
@@ -6272,7 +6294,7 @@ function renderRuleAccounts() {
   const byId = new Map(mrRules.map(r => [r.id, r]));
   $('mrAccNote').textContent = list.length ? list.length + ' 个账号' : '';
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="3"><div class="empty"><div class="big">账号池是空的</div>先到「账号池」添加账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="4"><div class="empty"><div class="big">账号池是空的</div>先到「账号池」添加账号</div></td></tr>';
     return;
   }
   tb.innerHTML = list.map(s => {
@@ -6284,9 +6306,17 @@ function renderRuleAccounts() {
     }).filter(Boolean).join(' ');
     const short = String(s.uid).length > 16 ? String(s.uid).slice(0, 16) + '…' : String(s.uid);
     const nm = remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>');
+    // 积分余额（issue #291）：规则大多与余额挂钩，省得来回切「账号池」。口径与
+    // 账号池同源（pool.Status.credits）：disabled 时是可用量 0，冻结快照在 credits_raw，
+    // 故 title 里一并给出，避免「明明还有额度却显示 0」的误读。
+    const cred = s.credits == null ? '—' : String(s.credits);
+    const credTip = s.credits == null ? '余额未知' :
+      '可用 ' + cred + (s.credits_total > 0 ? ' / 总额 ' + s.credits_total : '') +
+      (s.disabled && s.credits_raw > 0 ? '\n已禁用：可用 0，冻结快照 ' + s.credits_raw : '');
     return '<tr>' +
       '<td class="who"><div class="nm">' + nm + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div>' +
         '<div class="id">' + esc(short) + '</div></td>' +
+      '<td class="num" style="cursor:help" title="' + esc(credTip) + '">' + esc(cred) + '</td>' +
       '<td>' + (chips || '<span class="mr-dash">-</span>') + '</td>' +
       '<td class="num"><button class="xs" data-uid="' + esc(s.uid) + '">配置</button></td>' +
     '</tr>';
